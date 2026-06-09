@@ -74,7 +74,23 @@ static void test_mcp_dispatch() {
     auto r2 = server.handle_message(list);
     CHECK(r2.has_value());
     CHECK((*r2)["result"]["tools"].is_array());
-    CHECK((*r2)["result"]["tools"].size() >= 8);
+    CHECK((*r2)["result"]["tools"].size() >= 30);
+
+    // Spot-check that a few of the new tools are advertised by name.
+    {
+        const auto& arr = (*r2)["result"]["tools"];
+        auto has_tool = [&](const char* name) {
+            for (const auto& t : arr)
+                if (t.contains("name") && t["name"] == name) return true;
+            return false;
+        };
+        CHECK(has_tool("ue_python_exec"));
+        CHECK(has_tool("ue_set_actor_location"));
+        CHECK(has_tool("ue_save_asset"));
+        CHECK(has_tool("ue_get_viewport_camera"));
+        CHECK(has_tool("ue_list_presets"));
+        CHECK(has_tool("ue_property_array_append"));
+    }
 
     // unknown method -> -32601
     json bad = {{"jsonrpc", "2.0"}, {"id", 3}, {"method", "does/not/exist"}};
@@ -141,11 +157,46 @@ static void test_tool_degradation() {
         CHECK(!info.is_error);
         CHECK(info.payload["status"] == "unsupported");
 
+        // Python is NOT inferred from version — a 4.25 registry without the
+        // PythonScripting capability degrades ue_python_exec to unsupported.
+        auto py = tools.invoke(ctx, "ue_python_exec", json{{"code", "pass"}});
+        CHECK(!py.is_error);
+        CHECK(py.payload["status"] == "unsupported");
+        CHECK(py.payload["missingCapability"] == "python");
+
+        // PIE control is UE5-only -> unsupported on 4.25.
+        auto pie = tools.invoke(ctx, "ue_is_pie", json::object());
+        CHECK(!pie.is_error);
+        CHECK(pie.payload["status"] == "unsupported");
+
+        // Property array ops are 5.x-only -> unsupported on 4.25.
+        auto arr = tools.invoke(ctx, "ue_property_array_append",
+                                json{{"objectPath", "/X"}, {"propertyName", "P"}, {"value", 1}});
+        CHECK(!arr.is_error);
+        CHECK(arr.payload["status"] == "unsupported");
+
         // object.call IS available on 4.25 -> call_function passes the gate and
         // reaches the handler (which then reports the connection is down).
         auto call = tools.invoke(ctx, "ue_call_function",
                                  json{{"objectPath", "/X"}, {"functionName", "F"}});
         CHECK(call.payload["status"] == "error");  // handler ran, RC not connected
+    }
+
+    // (c) Probed as UE 5.5 with Python available: python + PIE tools pass the
+    //     gate and reach their handlers (which then fail on no connection).
+    {
+        uemcp::CapabilityRegistry caps_55;
+        caps_55.set_probed_for_test(
+            uemcp::CapabilityRegistry::parse_version("5.5.1-x+++UE5+Release-5.5"),
+            {uemcp::Capability::ObjectCall, uemcp::Capability::ObjectProperty,
+             uemcp::Capability::PythonScripting, uemcp::Capability::PieControl,
+             uemcp::Capability::PropertyArrayOps});
+        uemcp::ToolContext ctx{rc, caps_55};
+
+        auto py = tools.invoke(ctx, "ue_python_exec", json{{"code", "pass"}});
+        CHECK(py.payload["status"] == "error");  // gate passed; RC not connected
+        auto pie = tools.invoke(ctx, "ue_is_pie", json::object());
+        CHECK(pie.payload["status"] == "error");
     }
 }
 

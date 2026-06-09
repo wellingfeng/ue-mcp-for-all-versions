@@ -35,6 +35,8 @@ enum class Capability {
     DescribeObject,    // PUT /remote/object/describe (4.26+)
     PropertyArrayOps,  // append/insert/remove (5.x+)
     Presets,           // /remote/preset/* (4.26+)
+    PythonScripting,   // UPythonScriptLibrary present + Python enabled (probed)
+    PieControl,        // LevelEditorSubsystem PIE control (5.3+, version-gated)
 };
 
 class CapabilityRegistry {

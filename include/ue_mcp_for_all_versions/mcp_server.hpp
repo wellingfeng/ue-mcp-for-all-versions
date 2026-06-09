@@ -14,7 +14,7 @@
 namespace ue_mcp_for_all_versions {
 
 constexpr const char* kServerName = "ue-mcp-for-all-versions";
-constexpr const char* kServerVersion = "0.1.0";
+constexpr const char* kServerVersion = "0.2.0";
 constexpr const char* kProtocolVersion = "2024-11-05";
 
 class McpServer {

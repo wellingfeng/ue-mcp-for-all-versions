@@ -105,25 +105,77 @@ You can start the CLI before the editor — the server connects lazily (see
 
 ## Tools
 
+48 tools, grouped below. Every tool is **capability-gated**: if the connected
+engine lacks the required capability it returns
+`{"status":"unsupported", "reason": ..., "missingCapability": ...}` instead of
+failing. Tools marked *modern→legacy* call the UE5 editor subsystem first and
+fall back to the UE4 library automatically, so one tool spans 4.25 → 5.8.
+
+### Core RemoteControl
+
 | Tool | Requires | Description |
 |------|----------|-------------|
 | `ue_get_engine_version` | — | Engine version + detected capabilities |
-| `ue_call_function` | object.call | Call a UFunction (`/remote/object/call`) |
-| `ue_get_property` | object.property | Read a property |
-| `ue_set_property` | object.property | Write a property |
+| `ue_call_function` | object.call | Call any UFunction (`/remote/object/call`) |
+| `ue_get_property` / `ue_set_property` | object.property | Read / write a property |
 | `ue_remote_info` | info (4.26+) | RemoteControl server info / routes |
 | `ue_describe_object` | object.describe (4.26+) | Object properties & functions |
 | `ue_search_assets` | search.assets (4.26+) | Search project assets |
 | `ue_batch` | batch (4.26+) | Multiple RC requests in one round-trip |
-| `ue_list_actors` | object.call | List actors in the current level |
-| `ue_spawn_actor` | object.call | Spawn an actor from a class at a location |
-| `ue_destroy_actor` | object.call | Destroy an actor by object path |
-| `ue_list_assets` | object.call | List assets under a content directory |
-| `ue_does_asset_exist` | object.call | Check whether an asset path exists |
 
-The high-level helpers (`ue_list_actors`, `ue_spawn_actor`, …) call the engine's
-`EditorScriptingUtilities` library, so enable that plugin too (it ships with the
-engine). They work editor-side only.
+### Scripting & editor context
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_python_exec` | python (probed) | Run Python and capture result + log (`ExecutePythonCommandEx`). 4.25→5.8 when the PythonScriptPlugin is enabled |
+| `ue_exec_console_command` | object.call | Run an editor/console command (auto-resolves world context on UE4) |
+| `ue_get_editor_world` | object.call | Editor UWorld path (*modern→legacy*) |
+| `ue_get_project_info` | object.call | Aggregated engine/project metadata |
+
+### Actors
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_list_actors` | object.call | List level actors (*modern→legacy*) |
+| `ue_spawn_actor` / `ue_destroy_actor` | object.call | Spawn / destroy an actor (*modern→legacy*) |
+| `ue_get_actor_transform` | object.call | Read an actor's transform |
+| `ue_set_actor_location` / `_rotation` / `_scale` | object.call | Set actor location / rotation / scale |
+| `ue_get_actor_label` / `ue_set_actor_label` | object.call | Read / set the World Outliner label |
+| `ue_get_selected_actors` / `ue_select_actors` / `ue_clear_selection` | object.call | Editor selection (*modern→legacy*) |
+
+### Assets
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_list_assets` / `ue_does_asset_exist` | object.call | List / check assets (*modern→legacy*) |
+| `ue_find_asset_data` | object.call | Asset registry metadata |
+| `ue_save_asset` / `ue_save_directory` | object.call | Save an asset / a directory |
+| `ue_duplicate_asset` / `ue_rename_asset` | object.call | Duplicate / rename an asset |
+| `ue_delete_asset` | object.call | **Delete** an asset (destructive) |
+
+### Level, viewport & play
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_save_current_level` / `ue_load_level` / `ue_new_level` | object.call | Level open / save / new (*modern→legacy*) |
+| `ue_get_viewport_camera` / `ue_set_viewport_camera` | object.call | Read / move the editor viewport camera |
+| `ue_take_screenshot` | object.call | High-res editor screenshot |
+| `ue_is_pie` / `ue_stop_pie` | pie.control (5.x) | Query / end Play-In-Editor |
+
+### Property array ops & presets
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_property_array_append` / `_insert` / `_remove` | object.property.arrayops (5.0+) | In-place array property edits |
+| `ue_list_presets` / `ue_get_preset` | presets (4.26+) | List / inspect RemoteControl presets |
+| `ue_preset_call_function` | presets (4.26+) | Invoke a function exposed on a preset |
+| `ue_preset_get_property` / `ue_preset_set_property` | presets (4.26+) | Read / write an exposed preset property |
+
+The editor-side helpers call the engine's `EditorScriptingUtilities` library /
+UE5 editor subsystems, so enable that plugin too (it ships with the engine).
+For `ue_python_exec`, enable the **PythonScriptPlugin**. For
+`ue_exec_console_command`, enable *Allow Console Command Remote Execution* in
+Project Settings → Remote Control.
 
 A tool whose capability is absent on the connected engine returns
 `{"status":"unsupported", "reason": ..., "missingCapability": ...}` — never a
@@ -164,9 +216,17 @@ runtime degradation behave as designed:
 `EditorActorSubsystem` and fall back to the UE4 `EditorLevelLibrary`
 automatically, so one tool works across the 4.x ↔ 5.x boundary.
 
+The expanded tool set (Python, actor transform/label/selection, asset
+save/duplicate/rename/delete, level/viewport, PIE, property array ops, presets)
+was re-verified live against UE 5.5.1: spawning an actor, setting its
+location/rotation/scale, reading the transform back, setting/reading its label,
+selecting it, and saving — all confirmed end-to-end. Capability degradation was
+confirmed too (e.g. `ue_python_exec` returns `unsupported` when the
+PythonScriptPlugin is disabled rather than erroring).
+
 UE 5.8 (which also ships Epic's own experimental `ModelContextProtocol` plugin)
 is not yet hardware-tested here; the design adapts at runtime via `/remote/info`
-route discovery.
+route discovery and engine-version inference.
 
 ## Tests
 

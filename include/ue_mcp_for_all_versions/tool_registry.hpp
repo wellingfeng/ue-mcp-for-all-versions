@@ -70,6 +70,16 @@ private:
     // High-level editor convenience tools (actor/asset ops). Called by
     // register_builtins().
     void register_editor_helpers();
+    // Python execution + console command + editor context tools.
+    void register_scripting_tools();
+    // Actor transform / label / selection tools.
+    void register_actor_tools();
+    // Extended asset operation tools (save/duplicate/delete/rename/metadata).
+    void register_asset_tools();
+    // Level / viewport camera / PIE control tools.
+    void register_level_tools();
+    // Raw RemoteControl route tools: property array ops + presets.
+    void register_rc_route_tools();
 
     std::vector<Tool> tools_;
 };

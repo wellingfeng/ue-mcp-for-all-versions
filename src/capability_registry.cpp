@@ -16,6 +16,8 @@ const char* to_string(Capability cap) {
         case Capability::DescribeObject: return "object.describe";
         case Capability::PropertyArrayOps: return "object.property.arrayops";
         case Capability::Presets: return "presets";
+        case Capability::PythonScripting: return "python";
+        case Capability::PieControl: return "pie.control";
     }
     return "unknown";
 }
@@ -84,6 +86,19 @@ void CapabilityRegistry::probe(RcClient& client) {
         version_ = parse_version(ver.body["ReturnValue"].get<std::string>());
     }
 
+    // Python is NOT a version-based capability: the PythonScriptPlugin can be
+    // disabled in a project even on a version that ships it. Probe it directly.
+    // A clean {ReturnValue:true} means Python is available; anything else
+    // (false, 404 object-not-resolved, transport error) means it is not.
+    RcResult py = client.call_function(
+        "/Script/PythonScriptPlugin.Default__PythonScriptLibrary",
+        "IsPythonAvailable");
+    if (py.ok && py.body.is_object() && py.body.contains("ReturnValue") &&
+        py.body["ReturnValue"].is_boolean() &&
+        py.body["ReturnValue"].get<bool>()) {
+        caps_.insert(Capability::PythonScripting);
+    }
+
     infer_from_version();
 }
 
@@ -117,6 +132,11 @@ void CapabilityRegistry::infer_from_version() {
     if (v426 || route_has("/remote/preset")) caps_.insert(Capability::Presets);
     if (v5 || route_has("/remote/object/property/append"))
         caps_.insert(Capability::PropertyArrayOps);
+    // PIE control (IsInPlayInEditor / EditorRequestEndPlay) lives on
+    // ULevelEditorSubsystem, which only exists on UE 5.x (verified absent on
+    // 4.25/4.26). There is no /remote/info route for it, so this is
+    // version-gated only.
+    if (v5) caps_.insert(Capability::PieControl);
 }
 
 bool CapabilityRegistry::has(Capability cap) const {
@@ -128,7 +148,8 @@ json CapabilityRegistry::describe() const {
     for (Capability c : {Capability::ObjectCall, Capability::ObjectProperty,
                          Capability::Info, Capability::Batch,
                          Capability::SearchAssets, Capability::DescribeObject,
-                         Capability::PropertyArrayOps, Capability::Presets}) {
+                         Capability::PropertyArrayOps, Capability::Presets,
+                         Capability::PythonScripting, Capability::PieControl}) {
         if (has(c)) caps.push_back(to_string(c));
     }
     json out = {
