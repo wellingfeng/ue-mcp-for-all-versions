@@ -1,0 +1,11 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "4.26",
+	"Category": "",
+	"Description": "Minimal project for ue-mcp-for-all-versions self-test (UE 4.26)",
+	"Modules": [],
+	"Plugins": [
+		{ "Name": "RemoteControl", "Enabled": true },
+		{ "Name": "EditorScriptingUtilities", "Enabled": true }
+	]
+}

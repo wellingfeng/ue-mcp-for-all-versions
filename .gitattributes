@@ -1,0 +1,9 @@
+# Normalize line endings: keep LF in the repo for source/text.
+* text=auto eol=lf
+
+# Vendored third-party headers — leave untouched.
+third_party/** linguist-vendored
+
+# Windows batch/scripts that need CRLF (none currently, but future-proof).
+*.bat text eol=crlf
+*.cmd text eol=crlf

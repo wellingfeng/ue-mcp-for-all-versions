@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ue-mcp-for-all-versions": {
+      "command": "E:/uug_mcp/ue-mcp-for-all-versions/build/Release/ue-mcp-for-all-versions.exe",
+      "args": []
+    }
+  }
+}

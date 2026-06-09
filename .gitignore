@@ -1,0 +1,23 @@
+# Build output
+/build/
+/out/
+*.exe
+*.pdb
+*.lib
+*.obj
+
+# UE test projects: generated dirs (keep the .uproject only)
+test_project_*/Saved/
+test_project_*/Intermediate/
+test_project_*/DerivedDataCache/
+test_project_*/Binaries/
+test_project_*/Config/
+test_project_*/.vs/
+test_project_*/.freeultracode/
+
+# tooling scratch
+.freeultracode/
+**/.freeultracode/
+
+# Editor logs captured by the integration harness
+ue_editor*.log
