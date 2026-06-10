@@ -31,8 +31,11 @@ discovered **at runtime**.
 
 ## Requirements on the UE side (zero code intrusion)
 
-Enable the engine's stock **RemoteControl** plugin in your project (no source
-mod, no custom plugin). Then ensure the web server is running:
+Use the one-click setup command below for the normal path. It enables the
+engine's stock plugins and writes the version-specific RemoteControl settings
+needed by this server (no source mod, no custom plugin).
+
+Manual requirements, if you do not use setup:
 
 - **UE 4.26+** auto-starts it on `:30010` by default.
 - **UE 4.25** uses `:8080` and does **not** auto-start — run `WebControl.StartServer`
@@ -64,7 +67,40 @@ ue-mcp-for-all-versions [--host H] [--port P] [--probe]
   --probe    connect, print detected engine + capabilities as JSON, then exit
 ```
 
-Register it with an MCP client (example `.mcp.json`):
+### One-click project setup
+
+Point the binary at either a `.uproject` file or the project directory:
+
+```bash
+ue-mcp-for-all-versions --setup-project C:/path/to/MyGame
+```
+
+The setup command is designed for host apps such as FreeUltraCode to call from
+a single "Enable Unreal MCP" button. It:
+
+- detects the `.uproject` and `EngineAssociation`
+- enables `RemoteControl`, `EditorScriptingUtilities`, and `PythonScriptPlugin`
+- writes the correct RemoteControl config file for the engine line:
+  - UE 4.25: `Config/DefaultEngine.ini` startup CVar fallback
+  - UE 4.26: `Config/DefaultWebRemoteControl.ini`
+  - UE 5.x: `Config/DefaultRemoteControl.ini`
+- writes/merges project `.mcp.json` with this server command
+- prints a machine-readable JSON report listing changed files, notes and warnings
+
+Useful setup flags:
+
+```bash
+ue-mcp-for-all-versions --setup-project C:/path/to/MyGame --dry-run
+ue-mcp-for-all-versions --setup-project C:/path/to/MyGame --server-command C:/tools/ue-mcp-for-all-versions.exe
+ue-mcp-for-all-versions --setup-project C:/path/to/MyGame --no-python
+ue-mcp-for-all-versions --setup-project C:/path/to/MyGame --no-mcp-config
+```
+
+After setup, restart the Unreal Editor if plugins or RemoteControl settings
+changed. The MCP server itself can be started before the editor; it connects
+lazily and auto-reconnects.
+
+Manual MCP client config, if you do not use setup (example `.mcp.json`):
 
 ```json
 {
@@ -171,11 +207,11 @@ fall back to the UE4 library automatically, so one tool spans 4.25 → 5.8.
 | `ue_preset_call_function` | presets (4.26+) | Invoke a function exposed on a preset |
 | `ue_preset_get_property` / `ue_preset_set_property` | presets (4.26+) | Read / write an exposed preset property |
 
-The editor-side helpers call the engine's `EditorScriptingUtilities` library /
-UE5 editor subsystems, so enable that plugin too (it ships with the engine).
-For `ue_python_exec`, enable the **PythonScriptPlugin**. For
-`ue_exec_console_command`, enable *Allow Console Command Remote Execution* in
-Project Settings → Remote Control.
+The one-click setup command enables the stock engine plugins needed by these
+helpers. If configuring manually, enable `RemoteControl`,
+`EditorScriptingUtilities`, and `PythonScriptPlugin`. For Python tools on
+UE 5.x, setup also enables RemoteControl's remote Python execution project
+setting by default.
 
 A tool whose capability is absent on the connected engine returns
 `{"status":"unsupported", "reason": ..., "missingCapability": ...}` — never a
@@ -256,4 +292,3 @@ scripts/                           cross-version integration harness
 
 MIT. See `LICENSE`. Vendored third-party headers keep their own licenses
 (`nlohmann/json` — MIT; `cpp-httplib` — MIT).
-

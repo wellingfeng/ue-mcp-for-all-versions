@@ -1,20 +1,26 @@
 // ue-mcp-for-all-versions — unit tests (no external test framework; a tiny
 // assert harness so the binary is dependency-free and runs under ctest).
 #include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 
 #include "ue_mcp_for_all_versions/capability_registry.hpp"
 #include "ue_mcp_for_all_versions/mcp_server.hpp"
+#include "ue_mcp_for_all_versions/project_setup.hpp"
 #include "ue_mcp_for_all_versions/rc_client.hpp"
 #include "ue_mcp_for_all_versions/tool_registry.hpp"
 
 namespace uemcp = ue_mcp_for_all_versions;
+namespace fs = std::filesystem;
 using uemcp::json;
 
 static int g_failures = 0;
 static int g_checks = 0;
+static int g_temp_counter = 0;
 
 #define CHECK(cond)                                                        \
     do {                                                                   \
@@ -25,6 +31,44 @@ static int g_checks = 0;
                          #cond);                                           \
         }                                                                  \
     } while (0)
+
+static fs::path make_temp_dir(const std::string& name) {
+    fs::path root = fs::temp_directory_path() /
+                    ("uemcp_" + name + "_" + std::to_string(std::time(nullptr)) +
+                     "_" + std::to_string(++g_temp_counter));
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root, ec);
+    CHECK(!ec);
+    return root;
+}
+
+static void write_file(const fs::path& path, const std::string& text) {
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    CHECK(!ec);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << text;
+    CHECK(static_cast<bool>(out));
+}
+
+static std::string read_file(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+static bool plugin_enabled(const json& project, const std::string& name) {
+    if (!project.contains("Plugins") || !project["Plugins"].is_array()) return false;
+    for (const auto& plugin : project["Plugins"]) {
+        if (plugin.is_object() && plugin.value("Name", std::string()) == name &&
+            plugin.value("Enabled", false)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Version parsing
@@ -254,12 +298,116 @@ static void test_lazy_connect_state() {
     CHECK(caps.has(uemcp::Capability::SearchAssets));
 }
 
+// ---------------------------------------------------------------------------
+// One-click project setup:
+//  - UE 5.x writes DefaultRemoteControl.ini and enables full plugin coverage.
+//  - UE 4.26 writes DefaultWebRemoteControl.ini.
+//  - UE 4.25 writes the startup CVar fallback used by that older plugin.
+// ---------------------------------------------------------------------------
+static void test_project_setup_ue5() {
+    fs::path dir = make_temp_dir("setup_ue5");
+    write_file(dir / "Game.uproject",
+               "{\n"
+               "  \"FileVersion\": 3,\n"
+               "  \"EngineAssociation\": \"5.3\",\n"
+               "  \"Plugins\": [\n"
+               "    { \"Name\": \"RemoteControl\", \"Enabled\": false }\n"
+               "  ]\n"
+               "}\n");
+
+    uemcp::ProjectSetupOptions options;
+    options.input_path = dir;
+    options.server_command = "C:/Tools/ue-mcp-for-all-versions.exe";
+    auto result = uemcp::setup_unreal_project(options);
+    CHECK(result.ok);
+    CHECK(result.changed);
+
+    json project = json::parse(read_file(dir / "Game.uproject"));
+    CHECK(plugin_enabled(project, "RemoteControl"));
+    CHECK(plugin_enabled(project, "EditorScriptingUtilities"));
+    CHECK(plugin_enabled(project, "PythonScriptPlugin"));
+
+    std::string rc_ini = read_file(dir / "Config" / "DefaultRemoteControl.ini");
+    CHECK(rc_ini.find("[/Script/RemoteControlCommon.RemoteControlSettings]") !=
+          std::string::npos);
+    CHECK(rc_ini.find("bAutoStartWebServer=True") != std::string::npos);
+    CHECK(rc_ini.find("RemoteControlHttpServerPort=30010") != std::string::npos);
+    CHECK(rc_ini.find("bEnableRemotePythonExecution=True") != std::string::npos);
+
+    json mcp = json::parse(read_file(dir / ".mcp.json"));
+    CHECK(mcp["mcpServers"]["ue-mcp-for-all-versions"]["command"] ==
+          "C:/Tools/ue-mcp-for-all-versions.exe");
+
+    auto second = uemcp::setup_unreal_project(options);
+    CHECK(second.ok);
+    CHECK(!second.changed);
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+static void test_project_setup_ue426() {
+    fs::path dir = make_temp_dir("setup_ue426");
+    write_file(dir / "Game.uproject",
+               "{\n"
+               "  \"FileVersion\": 3,\n"
+               "  \"EngineAssociation\": \"4.26\"\n"
+               "}\n");
+
+    uemcp::ProjectSetupOptions options;
+    options.input_path = dir / "Game.uproject";
+    options.server_command = "C:/Tools/ue-mcp-for-all-versions.exe";
+    auto result = uemcp::setup_unreal_project(options);
+    CHECK(result.ok);
+
+    json project = json::parse(read_file(dir / "Game.uproject"));
+    CHECK(plugin_enabled(project, "RemoteControl"));
+    CHECK(plugin_enabled(project, "EditorScriptingUtilities"));
+    CHECK(plugin_enabled(project, "PythonScriptPlugin"));
+
+    std::string web_ini = read_file(dir / "Config" / "DefaultWebRemoteControl.ini");
+    CHECK(web_ini.find("[/Script/WebRemoteControl.WebRemoteControlSettings]") !=
+          std::string::npos);
+    CHECK(web_ini.find("RemoteControlHttpServerPort=30010") != std::string::npos);
+    CHECK(!fs::exists(dir / "Config" / "DefaultRemoteControl.ini"));
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+static void test_project_setup_ue425() {
+    fs::path dir = make_temp_dir("setup_ue425");
+    write_file(dir / "Game.uproject",
+               "{\n"
+               "  \"FileVersion\": 3,\n"
+               "  \"EngineAssociation\": \"4.25\",\n"
+               "  \"Plugins\": []\n"
+               "}\n");
+
+    uemcp::ProjectSetupOptions options;
+    options.input_path = dir;
+    options.server_command = "C:/Tools/ue-mcp-for-all-versions.exe";
+    auto result = uemcp::setup_unreal_project(options);
+    CHECK(result.ok);
+
+    std::string engine_ini = read_file(dir / "Config" / "DefaultEngine.ini");
+    CHECK(engine_ini.find("[SystemSettings]") != std::string::npos);
+    CHECK(engine_ini.find("WebControl.EnableServerOnStartup=1") != std::string::npos);
+    CHECK(!fs::exists(dir / "Config" / "DefaultWebRemoteControl.ini"));
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 int main() {
     test_version_parsing();
     test_mcp_dispatch();
     test_tool_degradation();
     test_rc_request_shapes();
     test_lazy_connect_state();
+    test_project_setup_ue5();
+    test_project_setup_ue426();
+    test_project_setup_ue425();
 
     std::fprintf(stderr, "\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) std::fprintf(stderr, "ALL TESTS PASSED\n");

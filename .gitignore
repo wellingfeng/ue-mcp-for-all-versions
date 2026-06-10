@@ -6,14 +6,8 @@
 *.lib
 *.obj
 
-# UE test projects: generated dirs (keep the .uproject only)
-test_project_*/Saved/
-test_project_*/Intermediate/
-test_project_*/DerivedDataCache/
-test_project_*/Binaries/
-test_project_*/Config/
-test_project_*/.vs/
-test_project_*/.freeultracode/
+# UE test projects
+test_project_*/
 
 # tooling scratch
 .freeultracode/

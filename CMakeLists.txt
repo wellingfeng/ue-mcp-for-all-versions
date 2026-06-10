@@ -29,6 +29,7 @@ endif()
 add_library(uemcp_core STATIC
   src/rc_client.cpp
   src/capability_registry.cpp
+  src/project_setup.cpp
   src/tool_registry.cpp
   src/mcp_server.cpp
 )
