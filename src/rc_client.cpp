@@ -117,6 +117,57 @@ RcResult RcClient::request(const std::string& verb, const std::string& path,
     return to_result(res);
 }
 
+RcBinaryResult RcClient::request_raw(const std::string& verb,
+                                     const std::string& path, const json& body) {
+    if (!ensure_connected()) {
+        return RcBinaryResult::fail(
+            "not connected to a RemoteControl server (is the engine running "
+            "with RemoteControl's web server started?)");
+    }
+    if (verb != "GET" && verb != "PUT" && verb != "POST" && verb != "DELETE") {
+        return RcBinaryResult::fail("unsupported HTTP verb: " + verb);
+    }
+    const std::string payload = body.is_null() ? std::string("{}") : body.dump();
+
+    auto send_once = [&]() -> httplib::Result {
+        if (verb == "GET") return impl_->http->Get(path.c_str());
+        if (verb == "PUT") return impl_->http->Put(path.c_str(), payload, "application/json");
+        if (verb == "POST") return impl_->http->Post(path.c_str(), payload, "application/json");
+        return impl_->http->Delete(path.c_str(), payload, "application/json");
+    };
+
+    httplib::Result res = send_once();
+    if (!res) {
+        // Same self-heal-and-retry-once policy as request().
+        connected_ = false;
+        impl_->http.reset();
+        attempted_once_ = false;
+        if (ensure_connected()) res = send_once();
+        if (!res) {
+            connected_ = false;
+            impl_->http.reset();
+            return RcBinaryResult::fail(
+                "connection lost: " + httplib::to_string(res.error()) +
+                " (will attempt reconnect on next request)");
+        }
+    }
+
+    RcBinaryResult r;
+    r.status = res->status;
+    r.ok = res->status >= 200 && res->status < 300;
+    r.data = res->body;
+    if (res->has_header("Content-Type")) {
+        r.content_type = res->get_header_value("Content-Type");
+    }
+    if (!r.ok) {
+        r.error = "HTTP " + std::to_string(res->status);
+        // On error, the body is usually a small JSON error message, not binary —
+        // surface it verbatim so callers can see what went wrong.
+        if (!res->body.empty() && res->body.size() < 4096) r.error += ": " + res->body;
+    }
+    return r;
+}
+
 RcResult RcClient::call_function(const std::string& object_path,
                                  const std::string& function_name,
                                  const json& parameters,

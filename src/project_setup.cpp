@@ -304,7 +304,21 @@ std::vector<std::pair<std::string, std::string>> remote_control_settings_5x(
         {section + "|RemoteControlWebsocketServerBindAddress", "127.0.0.1"},
     };
     if (enable_python) {
+        // Full-access profile (the default): let the MCP server drive every
+        // editor operation without hitting safety gates that can only be
+        // cleared interactively and therefore cannot be answered over a remote
+        // connection (which is what causes the "switch is itself protected, so
+        // it cannot be flipped remotely" deadlock). All flags below are
+        // URemoteControlSettings config properties that live in
+        // DefaultRemoteControl.ini and are only read at editor startup.
+        //   - bEnableRemotePythonExecution: allow remote Python evaluation.
+        //   - bIgnoreProtectedCheck: allow writing protected properties (e.g.
+        //     WidgetTree edits) over RemoteControl.
+        //   - bIgnoreGetterSetterCheck: allow direct property writes that would
+        //     otherwise require a blueprint getter/setter.
         values.push_back({section + "|bEnableRemotePythonExecution", "True"});
+        values.push_back({section + "|bIgnoreProtectedCheck", "True"});
+        values.push_back({section + "|bIgnoreGetterSetterCheck", "True"});
     }
     return values;
 }
@@ -466,6 +480,13 @@ ProjectSetupResult setup_unreal_project(const ProjectSetupOptions& options) {
         } else if (!result.error.empty()) {
             return result;
         }
+        if (options.enable_python) {
+            result.notes.push_back(
+                "UE 5.x full-access profile written to DefaultRemoteControl.ini: remote "
+                "Python plus bIgnoreProtectedCheck / bIgnoreGetterSetterCheck, so the MCP "
+                "server can edit protected properties (e.g. WidgetTree) without interactive "
+                "confirmation prompts.");
+        }
     } else {
         const fs::path engine_ini = config_dir / "DefaultEngine.ini";
         const fs::path web_ini = config_dir / "DefaultWebRemoteControl.ini";
@@ -507,6 +528,16 @@ ProjectSetupResult setup_unreal_project(const ProjectSetupOptions& options) {
     if (options.enable_python) {
         result.notes.push_back(
             "Python MCP tools are enabled by adding PythonScriptPlugin; UE 5.x also enables Remote Python execution.");
+    }
+    // The RemoteControl security flags and the WebControl startup CVars are read
+    // only when the editor boots, so a hot reload will not pick them up. Surface
+    // this as a warning (not just a note) whenever we actually wrote files, so
+    // callers / users do not silently keep talking to a stale editor.
+    if (result.changed) {
+        result.warnings.push_back(
+            "RESTART REQUIRED: close and reopen the Unreal Editor so the new plugin and "
+            "RemoteControl settings take effect. They are only read at editor startup; a "
+            "running editor will not pick them up.");
     }
     result.notes.push_back(
         "Restart the Unreal Editor after plugin or RemoteControl settings change.");

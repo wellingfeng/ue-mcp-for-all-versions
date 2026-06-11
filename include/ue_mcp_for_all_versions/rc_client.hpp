@@ -32,6 +32,26 @@ struct RcResult {
     }
 };
 
+// Outcome of a request whose response body is binary (e.g. an image), not JSON.
+// Used by routes like /remote/object/thumbnail that return raw PNG bytes rather
+// than a JSON document. `data` holds the undecoded bytes; `content_type` is the
+// response's Content-Type header (e.g. "image/png").
+struct RcBinaryResult {
+    bool ok = false;
+    int status = 0;
+    std::string data;          // raw response bytes (may be binary)
+    std::string content_type;  // Content-Type header, if any
+    std::string error;         // human-readable error when !ok
+
+    static RcBinaryResult fail(std::string msg, int status = 0) {
+        RcBinaryResult r;
+        r.ok = false;
+        r.status = status;
+        r.error = std::move(msg);
+        return r;
+    }
+};
+
 // Connection config. Host is always loopback in practice; we never bind or
 // reach a non-localhost address.
 struct RcConfig {
@@ -78,6 +98,13 @@ public:
     // connection so the next call re-probes.
     RcResult request(const std::string& verb, const std::string& path,
                      const json& body = json::object());
+
+    // Like request(), but does NOT parse the response as JSON — returns the raw
+    // bytes plus Content-Type. For routes that answer with binary payloads
+    // (images), e.g. PUT /remote/object/thumbnail. Same lazy-connect /
+    // reconnect-on-drop semantics as request().
+    RcBinaryResult request_raw(const std::string& verb, const std::string& path,
+                               const json& body = json::object());
 
     // Convenience: PUT /remote/object/call
     RcResult call_function(const std::string& object_path,

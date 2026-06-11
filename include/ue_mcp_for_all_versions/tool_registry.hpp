@@ -17,6 +17,11 @@ namespace ue_mcp_for_all_versions {
 struct ToolResult {
     bool is_error = false;
     json payload;  // serialized into a text content block
+    // Optional image content block (base64). When set, the MCP server emits an
+    // additional {type:"image", data, mimeType} content block alongside the
+    // text payload — used by tools that return rendered pixels (thumbnails).
+    std::string image_base64;
+    std::string image_mime;  // e.g. "image/png"
 
     static ToolResult ok(json p) { return ToolResult{false, std::move(p)}; }
     static ToolResult error(std::string msg, json extra = json::object()) {
@@ -32,6 +37,16 @@ struct ToolResult {
         p["status"] = "unsupported";
         p["reason"] = std::move(reason);
         return ToolResult{false, std::move(p)};
+    }
+    // Result carrying an image (plus a small JSON summary text block).
+    static ToolResult image(std::string base64, std::string mime, json summary) {
+        ToolResult r;
+        r.is_error = false;
+        r.payload = std::move(summary);
+        r.payload["status"] = "ok";
+        r.image_base64 = std::move(base64);
+        r.image_mime = std::move(mime);
+        return r;
     }
 };
 
@@ -80,6 +95,13 @@ private:
     void register_level_tools();
     // Raw RemoteControl route tools: property array ops + presets.
     void register_rc_route_tools();
+    // Scene introspection tools: find-by-class/label, components, bounds. These
+    // let an agent query the scene directly instead of guessing visually.
+    void register_introspection_tools();
+    // Material + visual tools: dynamic material params, object thumbnails.
+    void register_material_tools();
+    // Editor workflow + convenience tools: undo/redo, spawn-from-asset, etc.
+    void register_workflow_tools();
 
     std::vector<Tool> tools_;
 };

@@ -2,6 +2,7 @@
 // assert harness so the binary is dependency-free and runs under ctest).
 #include <cstdio>
 #include <ctime>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -134,6 +135,16 @@ static void test_mcp_dispatch() {
         CHECK(has_tool("ue_get_viewport_camera"));
         CHECK(has_tool("ue_list_presets"));
         CHECK(has_tool("ue_property_array_append"));
+        // Newer tools: scene introspection, material, visual, workflow.
+        CHECK(has_tool("ue_find_actors_by_class"));
+        CHECK(has_tool("ue_find_actors_by_label"));
+        CHECK(has_tool("ue_get_actor_components"));
+        CHECK(has_tool("ue_get_actor_bounds"));
+        CHECK(has_tool("ue_set_material_param"));
+        CHECK(has_tool("ue_get_object_thumbnail"));
+        CHECK(has_tool("ue_spawn_actor_from_asset"));
+        CHECK(has_tool("ue_focus_viewport_on_actor"));
+        CHECK(has_tool("ue_get_console_variable"));
     }
 
     // unknown method -> -32601
@@ -162,7 +173,13 @@ static void test_mcp_dispatch() {
 //      "unsupported" (true runtime auto-degrade), NOT an error.
 // ---------------------------------------------------------------------------
 static void test_tool_degradation() {
-    uemcp::RcClient rc;
+    // Pin to a port no RC server listens on, so "connection failed -> error"
+    // checks are deterministic even when a real editor is running on the default
+    // RC ports during local dev/CI.
+    uemcp::RcConfig closed;
+    closed.ports = {59998};
+    closed.connect_timeout = std::chrono::milliseconds(200);
+    uemcp::RcClient rc(closed);
     uemcp::ToolRegistry tools;
     tools.register_builtins();
 
@@ -218,6 +235,19 @@ static void test_tool_degradation() {
                                 json{{"objectPath", "/X"}, {"propertyName", "P"}, {"value", 1}});
         CHECK(!arr.is_error);
         CHECK(arr.payload["status"] == "unsupported");
+
+        // Thumbnails need the editor route (4.26+) -> unsupported on 4.25.
+        auto thumb = tools.invoke(ctx, "ue_get_object_thumbnail",
+                                  json{{"objectPath", "/Game/X"}});
+        CHECK(!thumb.is_error);
+        CHECK(thumb.payload["status"] == "unsupported");
+        CHECK(thumb.payload["missingCapability"] == "object.thumbnail");
+
+        // Scene introspection only needs object.call -> reaches handler, which
+        // then reports the connection is down (not "unsupported").
+        auto find = tools.invoke(ctx, "ue_find_actors_by_class",
+                                 json{{"actorClass", "/Script/Engine.StaticMeshActor"}});
+        CHECK(find.payload["status"] == "error");  // gate passed; RC not connected
 
         // object.call IS available on 4.25 -> call_function passes the gate and
         // reaches the handler (which then reports the connection is down).
@@ -333,6 +363,17 @@ static void test_project_setup_ue5() {
     CHECK(rc_ini.find("bAutoStartWebServer=True") != std::string::npos);
     CHECK(rc_ini.find("RemoteControlHttpServerPort=30010") != std::string::npos);
     CHECK(rc_ini.find("bEnableRemotePythonExecution=True") != std::string::npos);
+    // Full-access profile: protected/getter-setter gates are also lifted so the
+    // MCP server can edit protected properties without interactive prompts.
+    CHECK(rc_ini.find("bIgnoreProtectedCheck=True") != std::string::npos);
+    CHECK(rc_ini.find("bIgnoreGetterSetterCheck=True") != std::string::npos);
+
+    // A restart warning must be surfaced whenever files actually changed.
+    bool saw_restart_warning = false;
+    for (const auto& w : result.warnings) {
+        if (w.find("RESTART REQUIRED") != std::string::npos) saw_restart_warning = true;
+    }
+    CHECK(saw_restart_warning);
 
     json mcp = json::parse(read_file(dir / ".mcp.json"));
     CHECK(mcp["mcpServers"]["ue-mcp-for-all-versions"]["command"] ==

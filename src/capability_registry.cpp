@@ -18,6 +18,7 @@ const char* to_string(Capability cap) {
         case Capability::Presets: return "presets";
         case Capability::PythonScripting: return "python";
         case Capability::PieControl: return "pie.control";
+        case Capability::Thumbnail: return "object.thumbnail";
     }
     return "unknown";
 }
@@ -130,6 +131,9 @@ void CapabilityRegistry::infer_from_version() {
     if (v426 || route_has("/remote/search/assets")) caps_.insert(Capability::SearchAssets);
     if (v426 || route_has("/remote/object/describe")) caps_.insert(Capability::DescribeObject);
     if (v426 || route_has("/remote/preset")) caps_.insert(Capability::Presets);
+    // /remote/object/thumbnail is an editor route present 4.26+. Prefer route
+    // evidence; fall back to version.
+    if (v426 || route_has("/remote/object/thumbnail")) caps_.insert(Capability::Thumbnail);
     if (v5 || route_has("/remote/object/property/append"))
         caps_.insert(Capability::PropertyArrayOps);
     // PIE control (IsInPlayInEditor / EditorRequestEndPlay) lives on
@@ -149,7 +153,8 @@ json CapabilityRegistry::describe() const {
                          Capability::Info, Capability::Batch,
                          Capability::SearchAssets, Capability::DescribeObject,
                          Capability::PropertyArrayOps, Capability::Presets,
-                         Capability::PythonScripting, Capability::PieControl}) {
+                         Capability::PythonScripting, Capability::PieControl,
+                         Capability::Thumbnail}) {
         if (has(c)) caps.push_back(to_string(c));
     }
     json out = {

@@ -47,10 +47,21 @@ json McpServer::handle_tools_call(const json& params) {
     ToolContext ctx{rc_, caps_};
     ToolResult tr = tools_.invoke(ctx, name, args);
 
-    // MCP tools/call result: content blocks + isError. We serialize the
-    // structured payload as a single text block of pretty JSON.
+    // MCP tools/call result: content blocks + isError. We always serialize the
+    // structured payload as a text block; tools that produce pixels (e.g.
+    // thumbnails) additionally attach an image block so a vision-capable client
+    // can see the result directly.
+    json content = json::array();
+    content.push_back(json{{"type", "text"}, {"text", tr.payload.dump(2)}});
+    if (!tr.image_base64.empty()) {
+        content.push_back(json{
+            {"type", "image"},
+            {"data", tr.image_base64},
+            {"mimeType", tr.image_mime.empty() ? "image/png" : tr.image_mime},
+        });
+    }
     return json{
-        {"content", json::array({json{{"type", "text"}, {"text", tr.payload.dump(2)}}})},
+        {"content", std::move(content)},
         {"isError", tr.is_error},
     };
 }

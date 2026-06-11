@@ -1,6 +1,9 @@
 // ue-mcp-for-all-versions — tool registry implementation.
 #include "ue_mcp_for_all_versions/tool_registry.hpp"
 
+#include <cmath>
+#include <cstring>
+
 namespace ue_mcp_for_all_versions {
 
 void ToolRegistry::add(Tool tool) { tools_.push_back(std::move(tool)); }
@@ -137,8 +140,7 @@ ToolResult from_rc(const RcResult& res, json ok_extra = json::object()) {
     return ToolResult::ok(std::move(payload));
 }
 
-// -- Shared object-path constants (CDOs) used across helper groups. ----------
-// Legacy (UE4) BlueprintFunctionLibrary CDOs — present 4.25 -> 5.x but some
+// -- Shared object-path constants (CDOs) used across helper groups. ----------// Legacy (UE4) BlueprintFunctionLibrary CDOs — present 4.25 -> 5.x but some
 // functions are deprecated/blocked-remotely on UE5.
 constexpr const char* kEditorLevelLib =
     "/Script/EditorScriptingUtilities.Default__EditorLevelLibrary";
@@ -161,6 +163,8 @@ constexpr const char* kPythonScriptLib =
     "/Script/PythonScriptPlugin.Default__PythonScriptLibrary";
 constexpr const char* kAutomationLib =
     "/Script/FunctionalTesting.Default__AutomationBlueprintFunctionLibrary";
+constexpr const char* kMaterialEditingLib =
+    "/Script/MaterialEditor.Default__MaterialEditingLibrary";
 
 // Build an {X,Y,Z} object from an args sub-object with lower-case x/y/z keys.
 json xyz(const json& src, double dx = 0.0, double dy = 0.0, double dz = 0.0) {
@@ -348,6 +352,9 @@ void ToolRegistry::register_builtins() {
     register_asset_tools();
     register_level_tools();
     register_rc_route_tools();
+    register_introspection_tools();
+    register_material_tools();
+    register_workflow_tools();
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,6 +1210,578 @@ void ToolRegistry::register_rc_route_tools() {
             std::string path = "/remote/preset/" + url_encode_segment(preset) +
                                "/property/" + url_encode_segment(label);
             return from_rc(ctx.rc.request("PUT", path, body));
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Scene introspection tools. These are the antidote to "guess the scene from a
+// screenshot": they let an agent directly enumerate actors by class/label,
+// walk an actor's components, and read its bounds. find-by-class composes
+// GetAllLevelActors (modern/legacy) with EditorFilterLibrary.ByClass, which is
+// present and NOT remote-blocked 4.25 -> 5.x.
+// ---------------------------------------------------------------------------
+namespace {
+// Extract a string array out of an RcResult's {"ReturnValue":[...]} body.
+// Returns an empty optional if the shape isn't as expected.
+bool extract_return_array(const RcResult& r, json& out) {
+    if (!r.ok || !r.body.is_object() || !r.body.contains("ReturnValue") ||
+        !r.body["ReturnValue"].is_array())
+        return false;
+    out = r.body["ReturnValue"];
+    return true;
+}
+}  // namespace
+
+void ToolRegistry::register_introspection_tools() {
+    // -- ue_find_actors_by_class ---------------------------------------------
+    add(Tool{
+        "ue_find_actors_by_class",
+        "Find all actors in the level whose class matches actorClass (an object "
+        "path, e.g. /Script/Landscape.Landscape, /Script/Engine.StaticMeshActor, "
+        "or a Blueprint class path). Composes GetAllLevelActors with "
+        "EditorFilterLibrary.ByClass so it works 4.25 -> 5.x without a "
+        "show/hide-and-screenshot search. Returns the matching actor paths.",
+        json{{"type", "object"},
+             {"properties",
+              {{"actorClass", {{"type", "string"}, {"description", "class object path to match"}}}}},
+             {"required", json::array({"actorClass"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string cls = arg_str(args, "actorClass");
+            if (cls.empty()) return ToolResult::error("actorClass is required");
+            RcResult all = call_modern_then_legacy(ctx, kEditorActorSubsystem,
+                                                   kEditorLevelLib, "GetAllLevelActors");
+            json actors;
+            if (!extract_return_array(all, actors))
+                return from_rc(all);  // surface whatever went wrong
+            json params = {{"TargetArray", actors}, {"ObjectClass", cls},
+                           {"FilterType", "Include"}};
+            RcResult filtered = ctx.rc.call_function(kEditorFilterLib, "ByClass", params);
+            json matched;
+            if (!extract_return_array(filtered, matched)) return from_rc(filtered);
+            return ToolResult::ok(json{{"status", "ok"},
+                                       {"count", static_cast<int>(matched.size())},
+                                       {"actors", matched}});
+        }});
+
+    // -- ue_find_actors_by_label ---------------------------------------------
+    add(Tool{
+        "ue_find_actors_by_label",
+        "Find actors whose editor label (World Outliner name) matches a string. "
+        "match: Contains (default), MatchesWildcard, or ExactMatch. Composes "
+        "GetAllLevelActors with EditorFilterLibrary.ByActorLabel. Works "
+        "4.25 -> 5.x.",
+        json{{"type", "object"},
+             {"properties",
+              {{"label", {{"type", "string"}}},
+               {"match", {{"type", "string"}, {"enum", json::array({"Contains", "MatchesWildcard", "ExactMatch"})}}},
+               {"ignoreCase", {{"type", "boolean"}, {"description", "default true"}}}}},
+             {"required", json::array({"label"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string label = arg_str(args, "label");
+            if (label.empty()) return ToolResult::error("label is required");
+            RcResult all = call_modern_then_legacy(ctx, kEditorActorSubsystem,
+                                                   kEditorLevelLib, "GetAllLevelActors");
+            json actors;
+            if (!extract_return_array(all, actors)) return from_rc(all);
+            json params = {{"TargetArray", actors},
+                           {"NameSubString", label},
+                           {"StringMatch", arg_str(args, "match", "Contains")},
+                           {"FilterType", "Include"},
+                           {"bIgnoreCase", args.value("ignoreCase", true)}};
+            RcResult filtered = ctx.rc.call_function(kEditorFilterLib, "ByActorLabel", params);
+            json matched;
+            if (!extract_return_array(filtered, matched)) return from_rc(filtered);
+            return ToolResult::ok(json{{"status", "ok"},
+                                       {"count", static_cast<int>(matched.size())},
+                                       {"actors", matched}});
+        }});
+
+    // -- ue_get_actor_components ---------------------------------------------
+    add(Tool{
+        "ue_get_actor_components",
+        "List an actor's components, optionally filtered to a component class "
+        "(componentClass object path, default /Script/Engine.ActorComponent for "
+        "all). actorPath is an actor instance path from ue_list_actors or a "
+        "find tool. Calls AActor.K2_GetComponentsByClass (stable 4.25 -> 5.x). "
+        "Returns the component object paths — feed these to ue_set_material_param "
+        "or ue_get_property.",
+        json{{"type", "object"},
+             {"properties",
+              {{"actorPath", {{"type", "string"}}},
+               {"componentClass", {{"type", "string"}, {"description", "default /Script/Engine.ActorComponent"}}}}},
+             {"required", json::array({"actorPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string actor = arg_str(args, "actorPath");
+            if (actor.empty()) return ToolResult::error("actorPath is required");
+            json params = {{"ComponentClass",
+                            arg_str(args, "componentClass", "/Script/Engine.ActorComponent")}};
+            RcResult r = ctx.rc.call_function(actor, "K2_GetComponentsByClass", params);
+            json comps;
+            if (!extract_return_array(r, comps)) return from_rc(r);
+            return ToolResult::ok(json{{"status", "ok"},
+                                       {"count", static_cast<int>(comps.size())},
+                                       {"components", comps}});
+        }});
+
+    // -- ue_get_actor_bounds -------------------------------------------------
+    add(Tool{
+        "ue_get_actor_bounds",
+        "Return an actor's world-space bounding box (origin + box extent). "
+        "Useful for framing the viewport camera or understanding scale without a "
+        "screenshot. Calls AActor.GetActorBounds (4.25 -> 5.x). "
+        "onlyColliding restricts to collision-enabled components (default false).",
+        json{{"type", "object"},
+             {"properties",
+              {{"actorPath", {{"type", "string"}}},
+               {"onlyColliding", {{"type", "boolean"}}}}},
+             {"required", json::array({"actorPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string actor = arg_str(args, "actorPath");
+            if (actor.empty()) return ToolResult::error("actorPath is required");
+            json params = {{"bOnlyCollidingComponents", args.value("onlyColliding", false)}};
+            return from_rc(ctx.rc.call_function(actor, "GetActorBounds", params));
+        }});
+
+    // -- ue_get_actor_reference ----------------------------------------------
+    add(Tool{
+        "ue_get_actor_reference",
+        "Resolve an actor object reference from a path/name string "
+        "(EditorActorSubsystem.GetActorReference on UE5). Handy to turn a label "
+        "or partial path into a concrete actor path. UE5 subsystem; on UE4 use "
+        "ue_find_actors_by_label instead.",
+        json{{"type", "object"},
+             {"properties", {{"pathToActor", {{"type", "string"}}}}},
+             {"required", json::array({"pathToActor"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string p = arg_str(args, "pathToActor");
+            if (p.empty()) return ToolResult::error("pathToActor is required");
+            return from_rc(ctx.rc.call_function(kEditorActorSubsystem,
+                                                "GetActorReference", json{{"PathToActor", p}}));
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Material + visual tools. ue_set_material_param edits a component's material
+// at runtime by creating a Dynamic Material Instance on the chosen element and
+// setting a scalar/vector/texture parameter on it — the direct fix for tasks
+// like "make the terrain greener". ue_get_object_thumbnail returns rendered
+// pixels (base64 PNG) so a vision client can confirm a result.
+// ---------------------------------------------------------------------------
+namespace {
+// Standard base64 encoder (RFC 4648). Used to ship binary image bytes inside a
+// JSON MCP image content block.
+std::string base64_encode(const std::string& in) {
+    static const char* tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 3 <= in.size()) {
+        unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
+                     (static_cast<unsigned char>(in[i + 1]) << 8) |
+                     static_cast<unsigned char>(in[i + 2]);
+        out.push_back(tbl[(n >> 18) & 63]);
+        out.push_back(tbl[(n >> 12) & 63]);
+        out.push_back(tbl[(n >> 6) & 63]);
+        out.push_back(tbl[n & 63]);
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        unsigned n = static_cast<unsigned char>(in[i]) << 16;
+        out.push_back(tbl[(n >> 18) & 63]);
+        out.push_back(tbl[(n >> 12) & 63]);
+        out.push_back('=');
+        out.push_back('=');
+    } else if (i + 2 == in.size()) {
+        unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
+                     (static_cast<unsigned char>(in[i + 1]) << 8);
+        out.push_back(tbl[(n >> 18) & 63]);
+        out.push_back(tbl[(n >> 12) & 63]);
+        out.push_back(tbl[(n >> 6) & 63]);
+        out.push_back('=');
+    }
+    return out;
+}
+
+// Detect an image's media type from its leading magic bytes. RemoteControl
+// sometimes mislabels the Content-Type (e.g. UE 5.3 returns an SVG placeholder
+// icon for assets without a rendered thumbnail but still tags it image/png), so
+// we trust the bytes over the header. Returns an empty string if unrecognized.
+std::string sniff_image_mime(const std::string& d) {
+    auto starts = [&](const char* sig, size_t n) {
+        return d.size() >= n && std::memcmp(d.data(), sig, n) == 0;
+    };
+    if (starts("\x89PNG\r\n\x1a\n", 8)) return "image/png";
+    if (starts("\xFF\xD8\xFF", 3)) return "image/jpeg";
+    if (starts("GIF87a", 6) || starts("GIF89a", 6)) return "image/gif";
+    if (starts("BM", 2)) return "image/bmp";
+    // WEBP: "RIFF"...."WEBP"
+    if (d.size() >= 12 && std::memcmp(d.data(), "RIFF", 4) == 0 &&
+        std::memcmp(d.data() + 8, "WEBP", 4) == 0)
+        return "image/webp";
+    // SVG: text starting with "<svg" or an XML prologue that contains <svg.
+    {
+        size_t j = 0;
+        while (j < d.size() && (d[j] == ' ' || d[j] == '\t' || d[j] == '\r' ||
+                                d[j] == '\n' || d[j] == '\xEF' || d[j] == '\xBB' ||
+                                d[j] == '\xBF'))
+            ++j;
+        if (d.compare(j, 4, "<svg") == 0) return "image/svg+xml";
+        if (d.compare(j, 5, "<?xml") == 0 && d.find("<svg") != std::string::npos)
+            return "image/svg+xml";
+    }
+    return "";
+}
+}  // namespace
+
+void ToolRegistry::register_material_tools() {
+    // -- ue_set_material_param -----------------------------------------------
+    add(Tool{
+        "ue_set_material_param",
+        "Set a material parameter on a primitive component at runtime. Creates a "
+        "Dynamic Material Instance on the given element index (so the change is "
+        "live and undoable) and sets a scalar, vector (color), or texture "
+        "parameter on it. componentPath is a primitive/mesh component path (from "
+        "ue_get_actor_components). paramType: scalar | vector | texture. For "
+        "scalar pass value (number); for vector pass color {r,g,b,a}; for "
+        "texture pass textureValue (an asset path). This is the precise way to "
+        "e.g. recolor a mesh or landscape material without trial and error.",
+        json{{"type", "object"},
+             {"properties",
+              {{"componentPath", {{"type", "string"}}},
+               {"elementIndex", {{"type", "integer"}, {"description", "material slot (default 0)"}}},
+               {"paramName", {{"type", "string"}}},
+               {"paramType", {{"type", "string"}, {"enum", json::array({"scalar", "vector", "texture"})}}},
+               {"value", {{"type", "number"}, {"description", "scalar value"}}},
+               {"color", {{"type", "object"}, {"properties", {{"r", {{"type", "number"}}}, {"g", {{"type", "number"}}}, {"b", {{"type", "number"}}}, {"a", {{"type", "number"}}}}}}},
+               {"textureValue", {{"type", "string"}, {"description", "texture asset path"}}}}},
+             {"required", json::array({"componentPath", "paramName", "paramType"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string comp = arg_str(args, "componentPath");
+            const std::string param = arg_str(args, "paramName");
+            const std::string type = arg_str(args, "paramType");
+            if (comp.empty() || param.empty() || type.empty())
+                return ToolResult::error("componentPath, paramName and paramType are required");
+            const int element = args.value("elementIndex", 0);
+            // 1) Create (or fetch) a dynamic material instance on the element.
+            RcResult mid = ctx.rc.call_function(
+                comp, "CreateDynamicMaterialInstance",
+                json{{"ElementIndex", element}}, /*tx=*/true);
+            if (!mid.ok || !mid.body.is_object() || !mid.body.contains("ReturnValue") ||
+                !mid.body["ReturnValue"].is_string() ||
+                mid.body["ReturnValue"].get<std::string>().empty()) {
+                return from_rc(mid, json{{"hint",
+                    "could not create a dynamic material instance on this element; "
+                    "is componentPath a primitive component with a material slot?"}});
+            }
+            const std::string mid_path = mid.body["ReturnValue"].get<std::string>();
+            // 2) Set the requested parameter on the MID.
+            RcResult set;
+            if (type == "scalar") {
+                if (!args.contains("value"))
+                    return ToolResult::error("value is required for paramType=scalar");
+                set = ctx.rc.call_function(mid_path, "SetScalarParameterValue",
+                                           json{{"ParameterName", param},
+                                                {"Value", args["value"]}}, true);
+            } else if (type == "vector") {
+                json c = args.value("color", json::object());
+                json color = {{"R", c.value("r", 0.0)}, {"G", c.value("g", 0.0)},
+                              {"B", c.value("b", 0.0)}, {"A", c.value("a", 1.0)}};
+                set = ctx.rc.call_function(mid_path, "SetVectorParameterValue",
+                                           json{{"ParameterName", param},
+                                                {"Value", color}}, true);
+            } else if (type == "texture") {
+                const std::string tex = arg_str(args, "textureValue");
+                if (tex.empty())
+                    return ToolResult::error("textureValue is required for paramType=texture");
+                set = ctx.rc.call_function(mid_path, "SetTextureParameterValue",
+                                           json{{"ParameterName", param},
+                                                {"Value", tex}}, true);
+            } else {
+                return ToolResult::error("paramType must be scalar, vector or texture");
+            }
+            return from_rc(set, json{{"materialInstance", mid_path}});
+        }});
+
+    // -- ue_set_material_instance_param --------------------------------------
+    add(Tool{
+        "ue_set_material_instance_param",
+        "Set a parameter on a Material Instance Constant ASSET (persisted), via "
+        "MaterialEditingLibrary.SetMaterialInstance{Scalar,Vector}ParameterValue. "
+        "instancePath is the MIC asset path. paramType scalar|vector. Unlike "
+        "ue_set_material_param (which edits a live actor's dynamic instance), "
+        "this edits the saved asset. Requires the asset be a "
+        "UMaterialInstanceConstant. Works 4.25 -> 5.x.",
+        json{{"type", "object"},
+             {"properties",
+              {{"instancePath", {{"type", "string"}}},
+               {"paramName", {{"type", "string"}}},
+               {"paramType", {{"type", "string"}, {"enum", json::array({"scalar", "vector"})}}},
+               {"value", {{"type", "number"}}},
+               {"color", {{"type", "object"}}}}},
+             {"required", json::array({"instancePath", "paramName", "paramType"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string inst = arg_str(args, "instancePath");
+            const std::string param = arg_str(args, "paramName");
+            const std::string type = arg_str(args, "paramType");
+            if (inst.empty() || param.empty() || type.empty())
+                return ToolResult::error("instancePath, paramName and paramType are required");
+            if (type == "scalar") {
+                if (!args.contains("value"))
+                    return ToolResult::error("value is required for paramType=scalar");
+                return from_rc(ctx.rc.call_function(
+                    kMaterialEditingLib, "SetMaterialInstanceScalarParameterValue",
+                    json{{"Instance", inst}, {"ParameterName", param},
+                         {"Value", args["value"]}}, true));
+            }
+            if (type == "vector") {
+                json c = args.value("color", json::object());
+                json color = {{"R", c.value("r", 0.0)}, {"G", c.value("g", 0.0)},
+                              {"B", c.value("b", 0.0)}, {"A", c.value("a", 1.0)}};
+                return from_rc(ctx.rc.call_function(
+                    kMaterialEditingLib, "SetMaterialInstanceVectorParameterValue",
+                    json{{"Instance", inst}, {"ParameterName", param},
+                         {"Value", color}}, true));
+            }
+            return ToolResult::error("paramType must be scalar or vector");
+        }});
+
+    // -- ue_get_object_thumbnail ---------------------------------------------
+    add(Tool{
+        "ue_get_object_thumbnail",
+        "Render and return an object's thumbnail as an image "
+        "(PUT /remote/object/thumbnail, editor, 4.26+). objectPath is an asset "
+        "or actor path. Returns an image content block (PNG or JPEG, per the "
+        "engine's Content-Type) a vision-capable client can see directly — use "
+        "this to confirm a visual result instead of blindly editing. Returns "
+        "'unsupported' on engines without the route.",
+        json{{"type", "object"},
+             {"properties", {{"objectPath", {{"type", "string"}}}}},
+             {"required", json::array({"objectPath"})}},
+        {Capability::Thumbnail},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string obj = arg_str(args, "objectPath");
+            if (obj.empty()) return ToolResult::error("objectPath is required");
+            RcBinaryResult r = ctx.rc.request_raw("PUT", "/remote/object/thumbnail",
+                                                  json{{"ObjectPath", obj}});
+            if (!r.ok)
+                return ToolResult::error(r.error.empty() ? "thumbnail request failed" : r.error,
+                                         json{{"httpStatus", r.status}});
+            std::string mime = r.content_type.empty() ? "image/png" : r.content_type;
+            // Content-Type may include parameters (e.g. "image/png; charset=..."):
+            // keep only the media type for the MCP image block.
+            auto semi = mime.find(';');
+            if (semi != std::string::npos) mime = mime.substr(0, semi);
+            // Trust the bytes over the header: some engine versions mislabel the
+            // Content-Type (e.g. 5.3 returns an SVG placeholder tagged image/png
+            // for assets lacking a rendered thumbnail). Correct it when the magic
+            // bytes say otherwise so the client renders it right.
+            std::string sniffed = sniff_image_mime(r.data);
+            bool corrected = false;
+            if (!sniffed.empty() && sniffed != mime) {
+                mime = sniffed;
+                corrected = true;
+            }
+            json summary = {{"objectPath", obj},
+                            {"bytes", static_cast<int>(r.data.size())},
+                            {"mimeType", mime}};
+            if (corrected) {
+                summary["serverContentType"] = r.content_type;
+                // An SVG placeholder means the engine has no rendered thumbnail
+                // for this object yet — flag it so the caller doesn't mistake the
+                // generic icon for the asset's actual appearance.
+                if (mime == "image/svg+xml")
+                    summary["note"] =
+                        "engine returned a placeholder icon (no rendered "
+                        "thumbnail for this object); not the asset's appearance";
+            }
+            return ToolResult::image(base64_encode(r.data), mime, summary);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Editor workflow + convenience tools: load an asset, spawn from an asset
+// (e.g. drop a StaticMesh/Blueprint), pilot the viewport camera onto an actor,
+// toggle game view, read console variables, and focus the viewport on an actor.
+// All use stable UFunctions or the modern/legacy editor pair.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_workflow_tools() {
+    // -- ue_load_asset --------------------------------------------------------
+    add(Tool{
+        "ue_load_asset",
+        "Load an asset into memory and return its object path "
+        "(EditorAssetLibrary/Subsystem.LoadAsset). assetPath e.g. "
+        "\"/Game/Meshes/SM_Rock\". The returned path can be passed to "
+        "ue_spawn_actor_from_asset or material tools. Works 4.25 -> 5.x.",
+        json{{"type", "object"},
+             {"properties", {{"assetPath", {{"type", "string"}}}}},
+             {"required", json::array({"assetPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string path = arg_str(args, "assetPath");
+            if (path.empty()) return ToolResult::error("assetPath is required");
+            return from_rc(call_modern_then_legacy(ctx, kEditorAssetSubsystem,
+                                                   kEditorAssetLib, "LoadAsset",
+                                                   json{{"AssetPath", path}}));
+        }});
+
+    // -- ue_spawn_actor_from_asset -------------------------------------------
+    add(Tool{
+        "ue_spawn_actor_from_asset",
+        "Spawn an actor in the current level from an ASSET (e.g. a StaticMesh, "
+        "Blueprint, or particle system) at an optional location/rotation. Uses "
+        "EditorActorSubsystem.SpawnActorFromObject on UE5, EditorLevelLibrary on "
+        "UE4. assetPath is a content path; the editor picks an appropriate actor "
+        "type for it (StaticMeshActor for a mesh, etc.).",
+        json{{"type", "object"},
+             {"properties",
+              {{"assetPath", {{"type", "string"}}},
+               {"location", {{"type", "object"}, {"properties", {{"x", {{"type", "number"}}}, {"y", {{"type", "number"}}}, {"z", {{"type", "number"}}}}}}},
+               {"rotation", {{"type", "object"}, {"properties", {{"pitch", {{"type", "number"}}}, {"yaw", {{"type", "number"}}}, {"roll", {{"type", "number"}}}}}}}}},
+             {"required", json::array({"assetPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string asset = arg_str(args, "assetPath");
+            if (asset.empty()) return ToolResult::error("assetPath is required");
+            json params = {{"ObjectToUse", asset},
+                           {"Location", xyz(args.value("location", json::object()))},
+                           {"Rotation", pyr(args.value("rotation", json::object()))}};
+            return from_rc(call_modern_then_legacy(ctx, kEditorActorSubsystem,
+                                                   kEditorLevelLib, "SpawnActorFromObject",
+                                                   params, /*tx=*/true));
+        }});
+
+    // -- ue_set_actor_transform ----------------------------------------------
+    add(Tool{
+        "ue_set_actor_transform",
+        "Set an actor's full world transform in one call via "
+        "EditorActorSubsystem.SetActorTransform (UE5) / EditorLevelLibrary (UE4). "
+        "Pass actorPath, location {x,y,z}, rotation {pitch,yaw,roll} (degrees), "
+        "and scale {x,y,z}. Any omitted component defaults (0 loc/rot, 1 scale). "
+        "Prefer this over the per-axis setters when changing several at once.",
+        json{{"type", "object"},
+             {"properties",
+              {{"actorPath", {{"type", "string"}}},
+               {"location", {{"type", "object"}}},
+               {"rotation", {{"type", "object"}}},
+               {"scale", {{"type", "object"}}}}},
+             {"required", json::array({"actorPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string actor = arg_str(args, "actorPath");
+            if (actor.empty()) return ToolResult::error("actorPath is required");
+            // FTransform over RC takes a quaternion rotation, which is awkward
+            // for Euler input. Instead apply the three decomposed setters on the
+            // actor instance (each a stable UFunction 4.25 -> 5.x).
+            json results = json::object();
+            bool any_err = false;
+            if (args.contains("location")) {
+                RcResult r = ctx.rc.call_function(actor, "K2_SetActorLocation",
+                    json{{"NewLocation", xyz(args["location"])}, {"bSweep", false}, {"bTeleport", true}}, true);
+                results["location"] = r.ok ? "ok" : r.error;
+                any_err = any_err || !r.ok;
+            }
+            if (args.contains("rotation")) {
+                RcResult r = ctx.rc.call_function(actor, "K2_SetActorRotation",
+                    json{{"NewRotation", pyr(args["rotation"])}, {"bTeleportPhysics", true}}, true);
+                results["rotation"] = r.ok ? "ok" : r.error;
+                any_err = any_err || !r.ok;
+            }
+            if (args.contains("scale")) {
+                RcResult r = ctx.rc.call_function(actor, "SetActorScale3D",
+                    json{{"NewScale3D", xyz(args["scale"], 1.0, 1.0, 1.0)}}, true);
+                results["scale"] = r.ok ? "ok" : r.error;
+                any_err = any_err || !r.ok;
+            }
+            if (results.empty())
+                return ToolResult::error("provide at least one of location, rotation, scale");
+            json p = {{"status", any_err ? "error" : "ok"}, {"applied", results}};
+            return any_err ? ToolResult{true, p} : ToolResult::ok(p);
+        }});
+
+    // -- ue_focus_actor / ue_pilot_actor -------------------------------------
+    add(Tool{
+        "ue_focus_viewport_on_actor",
+        "Move the editor viewport camera to frame an actor, by reading its "
+        "bounds and pointing the camera at it. actorPath is an actor instance "
+        "path. Uses GetActorBounds + SetLevelViewportCameraInfo. distance "
+        "multiplies the bounds radius for camera pull-back (default 2.5).",
+        json{{"type", "object"},
+             {"properties",
+              {{"actorPath", {{"type", "string"}}},
+               {"distance", {{"type", "number"}}}}},
+             {"required", json::array({"actorPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string actor = arg_str(args, "actorPath");
+            if (actor.empty()) return ToolResult::error("actorPath is required");
+            RcResult b = ctx.rc.call_function(actor, "GetActorBounds",
+                                              json{{"bOnlyCollidingComponents", false}});
+            if (!b.ok || !b.body.is_object() || !b.body.contains("Origin"))
+                return from_rc(b, json{{"hint", "could not read actor bounds"}});
+            json origin = b.body["Origin"];
+            json extent = b.body.value("BoxExtent", json{{"X", 100}, {"Y", 100}, {"Z", 100}});
+            double ex = extent.value("X", 100.0), ey = extent.value("Y", 100.0),
+                   ez = extent.value("Z", 100.0);
+            double radius = std::sqrt(ex * ex + ey * ey + ez * ez);
+            double dist = args.value("distance", 2.5) * (radius > 1.0 ? radius : 100.0);
+            // Place the camera back along -X/-Y/+Z looking down at the origin.
+            json cam_loc = {{"X", origin.value("X", 0.0) - dist},
+                            {"Y", origin.value("Y", 0.0) - dist},
+                            {"Z", origin.value("Z", 0.0) + dist}};
+            // Yaw 45 toward +X+Y, pitch down ~ -35.
+            json cam_rot = {{"Pitch", -35.0}, {"Yaw", 45.0}, {"Roll", 0.0}};
+            RcResult set = call_modern_then_legacy(
+                ctx, kUnrealEditorSubsystem, kEditorLevelLib, "SetLevelViewportCameraInfo",
+                json{{"CameraLocation", cam_loc}, {"CameraRotation", cam_rot}});
+            return from_rc(set, json{{"framedActor", actor}, {"cameraLocation", cam_loc}});
+        }});
+
+    // -- ue_set_game_view -----------------------------------------------------
+    add(Tool{
+        "ue_set_game_view",
+        "Toggle the editor viewport between Game View (hides editor-only "
+        "billboards/icons) and editor view. Uses LevelEditorSubsystem on UE5, "
+        "EditorLevelLibrary on UE4. Pass gameView (boolean).",
+        json{{"type", "object"},
+             {"properties", {{"gameView", {{"type", "boolean"}}}}},
+             {"required", json::array({"gameView"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            json params = {{"bGameView", args.value("gameView", true)}};
+            return from_rc(call_modern_then_legacy(ctx, kLevelEditorSubsystem,
+                                                   kEditorLevelLib, "EditorSetGameView", params));
+        }});
+
+    // -- ue_get_console_variable ---------------------------------------------
+    add(Tool{
+        "ue_get_console_variable",
+        "Read the value of a console variable (CVar) such as r.ScreenPercentage "
+        "or r.ShadowQuality. type: float (default), int, bool, or string. Uses "
+        "KismetSystemLibrary.GetConsoleVariable*Value (4.25 -> 5.x).",
+        json{{"type", "object"},
+             {"properties",
+              {{"name", {{"type", "string"}}},
+               {"type", {{"type", "string"}, {"enum", json::array({"float", "int", "bool", "string"})}}}}},
+             {"required", json::array({"name"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string name = arg_str(args, "name");
+            if (name.empty()) return ToolResult::error("name is required");
+            const std::string t = arg_str(args, "type", "float");
+            const char* fn = "GetConsoleVariableFloatValue";
+            if (t == "int") fn = "GetConsoleVariableIntValue";
+            else if (t == "bool") fn = "GetConsoleVariableBoolValue";
+            else if (t == "string") fn = "GetConsoleVariableStringValue";
+            return from_rc(ctx.rc.call_function(kKismetSystemLib, fn,
+                                                json{{"VariableName", name}}));
         }});
 }
 

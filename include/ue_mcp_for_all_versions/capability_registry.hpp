@@ -37,6 +37,7 @@ enum class Capability {
     Presets,           // /remote/preset/* (4.26+)
     PythonScripting,   // UPythonScriptLibrary present + Python enabled (probed)
     PieControl,        // LevelEditorSubsystem PIE control (5.3+, version-gated)
+    Thumbnail,         // PUT /remote/object/thumbnail (editor, 4.26+, binary body)
 };
 
 class CapabilityRegistry {

@@ -84,8 +84,20 @@ a single "Enable Unreal MCP" button. It:
   - UE 4.25: `Config/DefaultEngine.ini` startup CVar fallback
   - UE 4.26: `Config/DefaultWebRemoteControl.ini`
   - UE 5.x: `Config/DefaultRemoteControl.ini`
+- on UE 5.x, writes the **full-access profile** by default so the MCP server
+  can drive every editor operation without interactive prompts:
+  `bEnableRemotePythonExecution`, `bIgnoreProtectedCheck`, and
+  `bIgnoreGetterSetterCheck` are all set to `True`. This avoids the deadlock
+  where protected-property edits (e.g. `WidgetTree.ConstructWidget`) require a
+  confirmation that cannot be answered over a remote connection. Pass
+  `--no-python` to keep the conservative defaults instead.
 - writes/merges project `.mcp.json` with this server command
 - prints a machine-readable JSON report listing changed files, notes and warnings
+
+> These settings are read only when the editor boots. After setup, **restart the
+> Unreal Editor** so the new plugins and RemoteControl flags take effect — a
+> running editor will not hot-reload them. The JSON report surfaces this as a
+> `RESTART REQUIRED` warning whenever files actually changed.
 
 Useful setup flags:
 
@@ -141,7 +153,7 @@ You can start the CLI before the editor — the server connects lazily (see
 
 ## Tools
 
-48 tools, grouped below. Every tool is **capability-gated**: if the connected
+61 tools, grouped below. Every tool is **capability-gated**: if the connected
 engine lacks the required capability it returns
 `{"status":"unsupported", "reason": ..., "missingCapability": ...}` instead of
 failing. Tools marked *modern→legacy* call the UE5 editor subsystem first and
@@ -206,6 +218,39 @@ fall back to the UE4 library automatically, so one tool spans 4.25 → 5.8.
 | `ue_list_presets` / `ue_get_preset` | presets (4.26+) | List / inspect RemoteControl presets |
 | `ue_preset_call_function` | presets (4.26+) | Invoke a function exposed on a preset |
 | `ue_preset_get_property` / `ue_preset_set_property` | presets (4.26+) | Read / write an exposed preset property |
+
+### Scene introspection
+
+Query the scene directly instead of guessing it from screenshots. These turn
+"which actor is the terrain and what controls its color" into a single lookup
+rather than a show/hide-and-screenshot search.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_find_actors_by_class` | object.call | All actors matching a class path (composes `GetAllLevelActors` + `EditorFilterLibrary.ByClass`) |
+| `ue_find_actors_by_label` | object.call | Actors whose Outliner label matches (Contains / Wildcard / Exact) |
+| `ue_get_actor_components` | object.call | An actor's components, optionally filtered by class (`K2_GetComponentsByClass`) |
+| `ue_get_actor_bounds` | object.call | World-space bounding box (origin + extent) |
+| `ue_get_actor_reference` | object.call | Resolve an actor path/name to a concrete reference (UE5) |
+
+### Materials & visuals
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_set_material_param` | object.call | Create a dynamic material instance on a component element and set a scalar / vector (color) / texture parameter — the precise way to recolor a mesh or landscape |
+| `ue_set_material_instance_param` | object.call | Set a scalar / vector parameter on a Material Instance Constant **asset** (`MaterialEditingLibrary`) |
+| `ue_get_object_thumbnail` | object.thumbnail (4.26+) | Render an object's thumbnail and return it as an **image** content block (PNG/JPEG per the engine) a vision client can see |
+
+### Editor workflow
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_load_asset` | object.call | Load an asset and return its object path (*modern→legacy*) |
+| `ue_spawn_actor_from_asset` | object.call | Spawn an actor from an asset (mesh / Blueprint / …) (*modern→legacy*) |
+| `ue_set_actor_transform` | object.call | Set location + rotation + scale together (decomposed setters) |
+| `ue_focus_viewport_on_actor` | object.call | Frame the viewport camera on an actor using its bounds |
+| `ue_set_game_view` | object.call | Toggle viewport Game View (*modern→legacy*) |
+| `ue_get_console_variable` | object.call | Read a CVar value (float / int / bool / string) |
 
 The one-click setup command enables the stock engine plugins needed by these
 helpers. If configuring manually, enable `RemoteControl`,
