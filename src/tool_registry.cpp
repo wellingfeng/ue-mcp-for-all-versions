@@ -165,7 +165,6 @@ constexpr const char* kAutomationLib =
     "/Script/FunctionalTesting.Default__AutomationBlueprintFunctionLibrary";
 constexpr const char* kMaterialEditingLib =
     "/Script/MaterialEditor.Default__MaterialEditingLibrary";
-
 // Build an {X,Y,Z} object from an args sub-object with lower-case x/y/z keys.
 json xyz(const json& src, double dx = 0.0, double dy = 0.0, double dz = 0.0) {
     return json{{"X", src.value("x", dx)},
@@ -178,6 +177,206 @@ json pyr(const json& src) {
     return json{{"Pitch", src.value("pitch", 0.0)},
                 {"Yaw", src.value("yaw", 0.0)},
                 {"Roll", src.value("roll", 0.0)}};
+}
+
+// -- base64 (RFC 4648) -------------------------------------------------------
+// Shared by the Python-recipe harness (encode args, decode the printed result)
+// and by the material thumbnail tool (encode image bytes). Defined once here
+// because all unnamed namespaces in this translation unit are the same
+// namespace — a second definition would be an ODR violation.
+std::string base64_encode(const std::string& in) {
+    static const char* tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 3 <= in.size()) {
+        unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
+                     (static_cast<unsigned char>(in[i + 1]) << 8) |
+                     static_cast<unsigned char>(in[i + 2]);
+        out.push_back(tbl[(n >> 18) & 63]);
+        out.push_back(tbl[(n >> 12) & 63]);
+        out.push_back(tbl[(n >> 6) & 63]);
+        out.push_back(tbl[n & 63]);
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        unsigned n = static_cast<unsigned char>(in[i]) << 16;
+        out.push_back(tbl[(n >> 18) & 63]);
+        out.push_back(tbl[(n >> 12) & 63]);
+        out.push_back('=');
+        out.push_back('=');
+    } else if (i + 2 == in.size()) {
+        unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
+                     (static_cast<unsigned char>(in[i + 1]) << 8);
+        out.push_back(tbl[(n >> 18) & 63]);
+        out.push_back(tbl[(n >> 12) & 63]);
+        out.push_back(tbl[(n >> 6) & 63]);
+        out.push_back('=');
+    }
+    return out;
+}
+
+// Decode a base64 string. Ignores whitespace; stops at padding. Returns the
+// decoded bytes; sets ok=false on an invalid character.
+std::string base64_decode(const std::string& in, bool& ok) {
+    auto val = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    ok = true;
+    std::string out;
+    int buf = 0, bits = 0;
+    for (unsigned char c : in) {
+        if (c == '=' ) break;
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+        int v = val(c);
+        if (v < 0) { ok = false; return out; }
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Python recipe harness. Layer-2 authoring tools (create blueprint / widget /
+// material, etc.) can't be expressed as a single RemoteControl UFunction call —
+// they need a short sequence of editor-Python steps. Rather than have the agent
+// drive that sequence one REPL round-trip at a time (the failure mode that cost
+// 27 minutes on the login-screen task), we ship the whole sequence as one
+// script and run it in a single ExecutePythonCommandEx call.
+//
+// Contract for a recipe script body:
+//   * It may read its arguments from the pre-defined dict `_ARGS`.
+//   * It must end by calling `_emit(result_dict)` exactly once. `_emit` prints
+//     a sentinel-wrapped JSON line that we parse out of the captured log.
+//   * Uncaught exceptions are caught by the harness preamble and emitted as
+//     `{"ok": false, "error": "..."}` so a failing recipe never hangs or leaks
+//     a raw traceback as the tool result.
+// This keeps Python-side logic readable while the C++ side stays a thin,
+// injection-safe transport.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr const char* kRecipeSentinel = "<<<UEMCP_RESULT>>>";
+
+// Assemble the full script: a preamble that decodes _ARGS and defines _emit,
+// then the recipe body wrapped in try/except so any error is reported through
+// the same sentinel channel instead of as an unstructured Python failure.
+std::string build_recipe_script(const std::string& body, const json& args) {
+    const std::string args_b64 = base64_encode(args.dump());
+    std::string s;
+    s += "import json, base64, traceback\n";
+    s += "import unreal\n";
+    s += "_ARGS = json.loads(base64.b64decode('" + args_b64 + "').decode('utf-8'))\n";
+    s += "def _emit(_d):\n";
+    s += "    print('" + std::string(kRecipeSentinel) + "' + json.dumps(_d))\n";
+    s += "try:\n";
+    // Indent every line of the body by 4 spaces so it sits inside the try.
+    {
+        std::string line;
+        for (char c : body) {
+            if (c == '\n') {
+                s += "    ";
+                s += line;
+                s += "\n";
+                line.clear();
+            } else {
+                line.push_back(c);
+            }
+        }
+        if (!line.empty()) {
+            s += "    ";
+            s += line;
+            s += "\n";
+        }
+    }
+    s += "except Exception as _e:\n";
+    s += "    _emit({'ok': False, 'error': str(_e), 'trace': traceback.format_exc()})\n";
+    return s;
+}
+
+// Parse the sentinel-wrapped JSON result out of an ExecutePythonCommandEx
+// response. The response shape is {ReturnValue, CommandResult, LogOutput:[{Type,
+// Output}]}; the recipe's _emit() print lands in LogOutput. Returns true and
+// fills `out` if a sentinel line was found and parsed.
+bool extract_recipe_result(const RcResult& rc, json& out) {
+    if (!rc.ok || !rc.body.is_object()) return false;
+    auto scan = [&](const std::string& text) -> bool {
+        std::string::size_type pos = text.rfind(kRecipeSentinel);
+        if (pos == std::string::npos) return false;
+        std::string tail = text.substr(pos + std::strlen(kRecipeSentinel));
+        // Trim to the end of the JSON (the log line may carry a trailing \n or
+        // extra log decoration); parse the first balanced JSON object.
+        std::string::size_type nl = tail.find('\n');
+        if (nl != std::string::npos) tail = tail.substr(0, nl);
+        try {
+            out = json::parse(tail);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+    if (rc.body.contains("LogOutput") && rc.body["LogOutput"].is_array()) {
+        // Concatenate then scan from the end so the last _emit wins.
+        std::string all;
+        for (const auto& entry : rc.body["LogOutput"]) {
+            if (entry.is_object() && entry.contains("Output") &&
+                entry["Output"].is_string()) {
+                all += entry["Output"].get<std::string>();
+            }
+        }
+        if (scan(all)) return true;
+    }
+    // Some engines surface the print on CommandResult instead.
+    if (rc.body.contains("CommandResult") && rc.body["CommandResult"].is_string()) {
+        if (scan(rc.body["CommandResult"].get<std::string>())) return true;
+    }
+    return false;
+}
+
+// Run a recipe end to end and turn it into a ToolResult. `body` is the Python
+// recipe (using _ARGS / _emit); `args` is passed through as _ARGS. On a missing
+// sentinel we surface the raw RC body so failures are diagnosable, never silent.
+ToolResult run_python_recipe(ToolContext& ctx, const std::string& body,
+                             const json& args) {
+    const std::string script = build_recipe_script(body, args);
+    RcResult rc = ctx.rc.call_function(
+        kPythonScriptLib, "ExecutePythonCommandEx",
+        json{{"PythonCommand", script},
+             // ExecuteFile compiles the whole string as a module (multi-line OK).
+             // ExecuteStatement would reject our multi-line preamble with
+             // "multiple statements found while compiling a single statement".
+             {"ExecutionMode", "ExecuteFile"},
+             {"FileExecutionScope", "Private"}});
+    if (!rc.ok) return from_rc(rc, json{{"hint", "Python recipe transport failed"}});
+    json result;
+    if (!extract_recipe_result(rc, result)) {
+        return ToolResult::error(
+            "Python recipe produced no parseable result (no sentinel in log)",
+            json{{"rcBody", rc.body}});
+    }
+    // The recipe reports success/failure via an "ok" boolean in its result.
+    const bool ok = result.value("ok", false);
+    if (!ok) {
+        json extra = result;
+        extra.erase("ok");
+        return ToolResult::error(result.value("error", "recipe reported failure"),
+                                 std::move(extra));
+    }
+    result.erase("ok");
+    result["status"] = "ok";
+    return ToolResult::ok(std::move(result));
 }
 
 }  // namespace
@@ -355,6 +554,11 @@ void ToolRegistry::register_builtins() {
     register_introspection_tools();
     register_material_tools();
     register_workflow_tools();
+    register_scene_tools();
+    register_mesh_light_tools();
+    register_creation_tools();
+    register_data_debug_tools();
+    register_authoring_tools();
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,42 +1577,9 @@ void ToolRegistry::register_introspection_tools() {
 // pixels (base64 PNG) so a vision client can confirm a result.
 // ---------------------------------------------------------------------------
 namespace {
-// Standard base64 encoder (RFC 4648). Used to ship binary image bytes inside a
-// JSON MCP image content block.
-std::string base64_encode(const std::string& in) {
-    static const char* tbl =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve(((in.size() + 2) / 3) * 4);
-    size_t i = 0;
-    while (i + 3 <= in.size()) {
-        unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
-                     (static_cast<unsigned char>(in[i + 1]) << 8) |
-                     static_cast<unsigned char>(in[i + 2]);
-        out.push_back(tbl[(n >> 18) & 63]);
-        out.push_back(tbl[(n >> 12) & 63]);
-        out.push_back(tbl[(n >> 6) & 63]);
-        out.push_back(tbl[n & 63]);
-        i += 3;
-    }
-    if (i + 1 == in.size()) {
-        unsigned n = static_cast<unsigned char>(in[i]) << 16;
-        out.push_back(tbl[(n >> 18) & 63]);
-        out.push_back(tbl[(n >> 12) & 63]);
-        out.push_back('=');
-        out.push_back('=');
-    } else if (i + 2 == in.size()) {
-        unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
-                     (static_cast<unsigned char>(in[i + 1]) << 8);
-        out.push_back(tbl[(n >> 18) & 63]);
-        out.push_back(tbl[(n >> 12) & 63]);
-        out.push_back(tbl[(n >> 6) & 63]);
-        out.push_back('=');
-    }
-    return out;
-}
-
-// Detect an image's media type from its leading magic bytes. RemoteControl
+// Standard base64 encoder lives at the top of this file (shared with the
+// Python-recipe harness). Detect an image's media type from its leading magic
+// bytes. RemoteControl
 // sometimes mislabels the Content-Type (e.g. UE 5.3 returns an SVG placeholder
 // icon for assets without a rendered thumbnail but still tags it image/png), so
 // we trust the bytes over the header. Returns an empty string if unrecognized.
@@ -1782,6 +1953,769 @@ void ToolRegistry::register_workflow_tools() {
             else if (t == "string") fn = "GetConsoleVariableStringValue";
             return from_rc(ctx.rc.call_function(kKismetSystemLib, fn,
                                                 json{{"VariableName", name}}));
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 — scene/actor authoring. Batch spawn (one /remote/batch round-trip
+// instead of N calls — the antidote to the per-actor latency that makes
+// "build a town" painfully slow), plus duplicate/attach/detach/folders and a
+// batched whole-scene transform read. All use stable UFunctions or the
+// modern/legacy editor pair, so they work 4.25 -> 5.x (batch needs 4.26+).
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_scene_tools() {
+    // -- ue_batch_spawn_actors ------------------------------------------------
+    add(Tool{
+        "ue_batch_spawn_actors",
+        "Spawn many actors in one RemoteControl round-trip (/remote/batch). Pass "
+        "actors: an array of {actorClass, location?{x,y,z}, rotation?"
+        "{pitch,yaw,roll}}. Far faster than calling ue_spawn_actor N times when "
+        "building a scene (town, maze, grid). Requires UE 4.26+ (batch route); on "
+        "4.25 returns 'unsupported'. Each sub-request targets EditorActorSubsystem "
+        "(UE5) — on UE4.26 use ue_spawn_actor per actor instead.",
+        json{{"type", "object"},
+             {"properties",
+              {{"actors",
+                {{"type", "array"},
+                 {"items",
+                  {{"type", "object"},
+                   {"properties",
+                    {{"actorClass", {{"type", "string"}}},
+                     {"location", {{"type", "object"}}},
+                     {"rotation", {{"type", "object"}}}}}}}}}}},
+             {"required", json::array({"actors"})}},
+        {Capability::Batch},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            if (!args.contains("actors") || !args["actors"].is_array())
+                return ToolResult::error("actors array is required");
+            json reqs = json::array();
+            int id = 1;
+            for (const auto& a : args["actors"]) {
+                json params = {
+                    {"ActorClass", a.value("actorClass", std::string())},
+                    {"Location", xyz(a.value("location", json::object()))},
+                    {"Rotation", pyr(a.value("rotation", json::object()))},
+                };
+                reqs.push_back({
+                    {"RequestId", id++},
+                    {"URL", "/remote/object/call"},
+                    {"Verb", "PUT"},
+                    {"Body", {{"ObjectPath", kEditorActorSubsystem},
+                              {"FunctionName", "SpawnActorFromClass"},
+                              {"Parameters", params},
+                              {"GenerateTransaction", true}}},
+                });
+            }
+            return from_rc(ctx.rc.request("PUT", "/remote/batch",
+                                          json{{"Requests", reqs}}),
+                           json{{"requested", static_cast<int>(args["actors"].size())}});
+        }});
+
+    // -- ue_duplicate_actor ---------------------------------------------------
+    add(Tool{
+        "ue_duplicate_actor",
+        "Duplicate an existing level actor (optionally offset). Pass actorPath "
+        "and optional offset {x,y,z}. Uses EditorActorSubsystem.DuplicateActor on "
+        "UE5, EditorLevelLibrary on UE4. Returns the new actor path.",
+        json{{"type", "object"},
+             {"properties",
+              {{"actorPath", {{"type", "string"}}},
+               {"offset", {{"type", "object"}}}}},
+             {"required", json::array({"actorPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string actor = arg_str(args, "actorPath");
+            if (actor.empty()) return ToolResult::error("actorPath is required");
+            json params = {{"ActorToDuplicate", actor},
+                           {"OffsetLocation", xyz(args.value("offset", json::object()))}};
+            return from_rc(call_modern_then_legacy(ctx, kEditorActorSubsystem,
+                                                   kEditorLevelLib, "DuplicateActor",
+                                                   params, /*tx=*/true));
+        }});
+
+    // -- ue_attach_actor / ue_detach_actor -----------------------------------
+    add(Tool{
+        "ue_attach_actor",
+        "Attach one actor to another (parent/child in the World Outliner and "
+        "transform hierarchy). Pass childPath and parentPath. socketName and "
+        "weldSimulatedBodies are optional. Calls AActor.K2_AttachToActor "
+        "(4.25 -> 5.x) with KeepWorld transform rules.",
+        json{{"type", "object"},
+             {"properties",
+              {{"childPath", {{"type", "string"}}},
+               {"parentPath", {{"type", "string"}}},
+               {"socketName", {{"type", "string"}}}}},
+             {"required", json::array({"childPath", "parentPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string child = arg_str(args, "childPath");
+            const std::string parent = arg_str(args, "parentPath");
+            if (child.empty() || parent.empty())
+                return ToolResult::error("childPath and parentPath are required");
+            json params = {{"ParentActor", parent},
+                           {"SocketName", arg_str(args, "socketName", "")},
+                           {"LocationRule", "KeepWorld"},
+                           {"RotationRule", "KeepWorld"},
+                           {"ScaleRule", "KeepWorld"},
+                           {"bWeldSimulatedBodies", args.value("weldSimulatedBodies", false)}};
+            return from_rc(ctx.rc.call_function(child, "K2_AttachToActor", params, true));
+        }});
+    add(Tool{
+        "ue_detach_actor",
+        "Detach an actor from its parent, keeping its current world transform. "
+        "Pass actorPath. Calls AActor.K2_DetachFromActor (4.25 -> 5.x).",
+        json{{"type", "object"},
+             {"properties", {{"actorPath", {{"type", "string"}}}}},
+             {"required", json::array({"actorPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string actor = arg_str(args, "actorPath");
+            if (actor.empty()) return ToolResult::error("actorPath is required");
+            json params = {{"LocationRule", "KeepWorld"},
+                           {"RotationRule", "KeepWorld"},
+                           {"ScaleRule", "KeepWorld"}};
+            return from_rc(ctx.rc.call_function(actor, "K2_DetachFromActor", params, true));
+        }});
+
+    // -- ue_set_actor_folder --------------------------------------------------
+    add(Tool{
+        "ue_set_actor_folder",
+        "Set an actor's World Outliner folder path (organizes the outliner; e.g. "
+        "\"Lights/Interior\"). Pass actorPath and folderPath. Sets the actor's "
+        "FolderPath property via RemoteControl. Editor-only.",
+        json{{"type", "object"},
+             {"properties",
+              {{"actorPath", {{"type", "string"}}},
+               {"folderPath", {{"type", "string"}}}}},
+             {"required", json::array({"actorPath", "folderPath"})}},
+        {Capability::ObjectProperty},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string actor = arg_str(args, "actorPath");
+            const std::string folder = arg_str(args, "folderPath");
+            if (actor.empty()) return ToolResult::error("actorPath is required");
+            return from_rc(ctx.rc.set_property(actor, "FolderPath", folder, true));
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 — mesh + lighting. Swap a component's static mesh, assign a material
+// asset to a slot (the basic counterpart to ue_set_material_param's dynamic
+// instance), and edit light component properties (intensity/color/sun angle).
+// These act on COMPONENT instance paths (from ue_get_actor_components) and use
+// stable UFunctions / property writes, working 4.25 -> 5.x.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_mesh_light_tools() {
+    // -- ue_set_static_mesh ---------------------------------------------------
+    add(Tool{
+        "ue_set_static_mesh",
+        "Swap the mesh on a StaticMeshComponent. Pass componentPath (from "
+        "ue_get_actor_components, class StaticMeshComponent) and meshPath (a "
+        "StaticMesh asset path, e.g. /Engine/BasicShapes/Sphere.Sphere). Calls "
+        "UStaticMeshComponent.SetStaticMesh (4.25 -> 5.x).",
+        json{{"type", "object"},
+             {"properties",
+              {{"componentPath", {{"type", "string"}}},
+               {"meshPath", {{"type", "string"}}}}},
+             {"required", json::array({"componentPath", "meshPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string comp = arg_str(args, "componentPath");
+            const std::string mesh = arg_str(args, "meshPath");
+            if (comp.empty() || mesh.empty())
+                return ToolResult::error("componentPath and meshPath are required");
+            return from_rc(ctx.rc.call_function(comp, "SetStaticMesh",
+                                                json{{"NewMesh", mesh}}, true));
+        }});
+
+    // -- ue_set_actor_material ------------------------------------------------
+    add(Tool{
+        "ue_set_actor_material",
+        "Assign a material ASSET to a primitive component's material slot. Pass "
+        "componentPath, elementIndex (default 0), and materialPath (a Material or "
+        "MaterialInstance asset path). Unlike ue_set_material_param (which makes a "
+        "live dynamic instance and tweaks a parameter), this sets the slot's "
+        "material outright. Calls UPrimitiveComponent.SetMaterial (4.25 -> 5.x).",
+        json{{"type", "object"},
+             {"properties",
+              {{"componentPath", {{"type", "string"}}},
+               {"elementIndex", {{"type", "integer"}}},
+               {"materialPath", {{"type", "string"}}}}},
+             {"required", json::array({"componentPath", "materialPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string comp = arg_str(args, "componentPath");
+            const std::string mat = arg_str(args, "materialPath");
+            if (comp.empty() || mat.empty())
+                return ToolResult::error("componentPath and materialPath are required");
+            json params = {{"ElementIndex", args.value("elementIndex", 0)},
+                           {"Material", mat}};
+            return from_rc(ctx.rc.call_function(comp, "SetMaterial", params, true));
+        }});
+
+    // -- ue_set_light_property ------------------------------------------------
+    add(Tool{
+        "ue_set_light_property",
+        "Set intensity and/or color on a LightComponent. Pass componentPath (a "
+        "Light component path from ue_get_actor_components; class e.g. "
+        "PointLightComponent, DirectionalLightComponent). intensity (number) and "
+        "color {r,g,b} are both optional — pass whichever you want to change. "
+        "Calls SetIntensity / SetLightColor (4.25 -> 5.x).",
+        json{{"type", "object"},
+             {"properties",
+              {{"componentPath", {{"type", "string"}}},
+               {"intensity", {{"type", "number"}}},
+               {"color", {{"type", "object"}, {"properties", {{"r", {{"type", "number"}}}, {"g", {{"type", "number"}}}, {"b", {{"type", "number"}}}}}}}}},
+             {"required", json::array({"componentPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string comp = arg_str(args, "componentPath");
+            if (comp.empty()) return ToolResult::error("componentPath is required");
+            json applied = json::object();
+            bool any = false, any_err = false;
+            if (args.contains("intensity")) {
+                RcResult r = ctx.rc.call_function(comp, "SetIntensity",
+                                                  json{{"NewIntensity", args["intensity"]}}, true);
+                applied["intensity"] = r.ok ? "ok" : r.error;
+                any = true; any_err = any_err || !r.ok;
+            }
+            if (args.contains("color") && args["color"].is_object()) {
+                const json& c = args["color"];
+                json color = {{"R", c.value("r", 1.0)}, {"G", c.value("g", 1.0)},
+                              {"B", c.value("b", 1.0)}, {"A", 1.0}};
+                RcResult r = ctx.rc.call_function(comp, "SetLightColor",
+                                                  json{{"NewLightColor", color},
+                                                       {"bSRGB", true}}, true);
+                applied["color"] = r.ok ? "ok" : r.error;
+                any = true; any_err = any_err || !r.ok;
+            }
+            if (!any) return ToolResult::error("provide intensity and/or color");
+            json p = {{"status", any_err ? "error" : "ok"}, {"applied", applied}};
+            return any_err ? ToolResult{true, p} : ToolResult::ok(p);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 — asset/material creation + import. These can't be one UFunction
+// call (they create a factory, run it, and save), so they're Python recipes run
+// in a single ExecutePythonCommandEx round-trip via run_python_recipe. They
+// require the PythonScriptPlugin (auto-degrade to 'unsupported' otherwise).
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_creation_tools() {
+    // -- ue_create_material ---------------------------------------------------
+    add(Tool{
+        "ue_create_material",
+        "Create a new Material asset. Pass name and packagePath (e.g. "
+        "\"/Game/Materials\"), and optional baseColor {r,g,b} to set the "
+        "material's constant base color. Returns the created asset path. Runs as "
+        "a single Python recipe; requires the PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"name", {{"type", "string"}}},
+               {"packagePath", {{"type", "string"}}},
+               {"baseColor", {{"type", "object"}, {"properties", {{"r", {{"type", "number"}}}, {"g", {{"type", "number"}}}, {"b", {{"type", "number"}}}}}}}}},
+             {"required", json::array({"name", "packagePath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+name = _ARGS['name']
+pkg = _ARGS['packagePath']
+tools = unreal.AssetToolsHelpers.get_asset_tools()
+mat = tools.create_asset(name, pkg, unreal.Material, unreal.MaterialFactoryNew())
+if mat is None:
+    _emit({'ok': False, 'error': 'create_asset returned None'})
+else:
+    bc = _ARGS.get('baseColor')
+    if bc is not None:
+        node = unreal.MaterialEditingLibrary.create_material_expression(mat, unreal.MaterialExpressionConstant3Vector)
+        node.set_editor_property('constant', unreal.LinearColor(bc.get('r',0.5), bc.get('g',0.5), bc.get('b',0.5), 1.0))
+        unreal.MaterialEditingLibrary.connect_material_property(node, '', unreal.MaterialProperty.MP_BASE_COLOR)
+        unreal.MaterialEditingLibrary.recompile_material(mat)
+    unreal.EditorAssetLibrary.save_asset(mat.get_path_name())
+    _emit({'ok': True, 'assetPath': mat.get_path_name()})
+)PY";
+            const std::string name = arg_str(args, "name");
+            const std::string pkg = arg_str(args, "packagePath");
+            if (name.empty() || pkg.empty())
+                return ToolResult::error("name and packagePath are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_create_material_instance -----------------------------------------
+    add(Tool{
+        "ue_create_material_instance",
+        "Create a Material Instance Constant (MIC) asset parented to a material. "
+        "Pass name, packagePath, and parentMaterialPath. The result can be tuned "
+        "with ue_set_material_instance_param. Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"name", {{"type", "string"}}},
+               {"packagePath", {{"type", "string"}}},
+               {"parentMaterialPath", {{"type", "string"}}}}},
+             {"required", json::array({"name", "packagePath", "parentMaterialPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+name = _ARGS['name']
+pkg = _ARGS['packagePath']
+parent = _ARGS['parentMaterialPath']
+tools = unreal.AssetToolsHelpers.get_asset_tools()
+mic = tools.create_asset(name, pkg, unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew())
+if mic is None:
+    _emit({'ok': False, 'error': 'create_asset returned None'})
+else:
+    pm = unreal.EditorAssetLibrary.load_asset(parent)
+    if pm is not None:
+        unreal.MaterialEditingLibrary.set_material_instance_parent(mic, pm)
+    unreal.EditorAssetLibrary.save_asset(mic.get_path_name())
+    _emit({'ok': True, 'assetPath': mic.get_path_name(), 'parentSet': pm is not None})
+)PY";
+            if (arg_str(args, "name").empty() || arg_str(args, "packagePath").empty() ||
+                arg_str(args, "parentMaterialPath").empty())
+                return ToolResult::error("name, packagePath and parentMaterialPath are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_import_asset ------------------------------------------------------
+    add(Tool{
+        "ue_import_asset",
+        "Import a source file (FBX, OBJ, PNG, etc.) into the project. Pass "
+        "sourceFile (an absolute path on the machine running the editor) and "
+        "destinationPath (a content folder, e.g. \"/Game/Imported\"). Returns the "
+        "imported asset path(s). Python recipe using AssetImportTask; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"sourceFile", {{"type", "string"}}},
+               {"destinationPath", {{"type", "string"}}}}},
+             {"required", json::array({"sourceFile", "destinationPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+src = _ARGS['sourceFile']
+dst = _ARGS['destinationPath']
+task = unreal.AssetImportTask()
+task.set_editor_property('filename', src)
+task.set_editor_property('destination_path', dst)
+task.set_editor_property('automated', True)
+task.set_editor_property('save', True)
+task.set_editor_property('replace_existing', True)
+unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+imported = list(task.get_editor_property('imported_object_paths') or [])
+_emit({'ok': len(imported) > 0, 'error': '' if imported else 'no objects imported (check source path/format)', 'imported': imported})
+)PY";
+            if (arg_str(args, "sourceFile").empty() || arg_str(args, "destinationPath").empty())
+                return ToolResult::error("sourceFile and destinationPath are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_create_folder -----------------------------------------------------
+    add(Tool{
+        "ue_create_folder",
+        "Create a content-browser folder, e.g. \"/Game/MyStuff\". Python recipe; "
+        "requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties", {{"path", {{"type", "string"}}}}},
+             {"required", json::array({"path"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+path = _ARGS['path']
+made = unreal.EditorAssetLibrary.make_directory(path)
+_emit({'ok': bool(made), 'error': '' if made else 'make_directory failed', 'path': path})
+)PY";
+            if (arg_str(args, "path").empty())
+                return ToolResult::error("path is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 — data tables + extra debug. Data table row read/write are Python
+// recipes (the data-table API isn't cleanly RC-callable). Console-variable
+// WRITE complements the existing read-only ue_get_console_variable. Log read
+// and PIE-start round out the debug surface. PIE start is 5.5+ only.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_data_debug_tools() {
+    // -- ue_data_table_get_rows ----------------------------------------------
+    add(Tool{
+        "ue_data_table_get_rows",
+        "Read a DataTable's rows as JSON. Pass tablePath (a DataTable asset "
+        "path). Returns rowNames and the rows export. Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties", {{"tablePath", {{"type", "string"}}}}},
+             {"required", json::array({"tablePath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+dt = unreal.EditorAssetLibrary.load_asset(_ARGS['tablePath'])
+if dt is None:
+    _emit({'ok': False, 'error': 'could not load table'})
+else:
+    names = [str(n) for n in unreal.DataTableFunctionLibrary.get_data_table_row_names(dt)]
+    export = unreal.DataTableFunctionLibrary.get_data_table_as_json(dt) if hasattr(unreal.DataTableFunctionLibrary, 'get_data_table_as_json') else ''
+    _emit({'ok': True, 'rowNames': names, 'json': export})
+)PY";
+            if (arg_str(args, "tablePath").empty())
+                return ToolResult::error("tablePath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_set_cvar ----------------------------------------------------------
+    add(Tool{
+        "ue_set_cvar",
+        "Set a console variable's value (the write counterpart to "
+        "ue_get_console_variable). Pass name and value (string form, e.g. \"50\" "
+        "for r.ScreenPercentage). Routes through a console command so it works "
+        "4.25 -> 5.x.",
+        json{{"type", "object"},
+             {"properties",
+              {{"name", {{"type", "string"}}},
+               {"value", {{"type", "string"}}}}},
+             {"required", json::array({"name", "value"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string name = arg_str(args, "name");
+            const std::string value = arg_str(args, "value");
+            if (name.empty()) return ToolResult::error("name is required");
+            const std::string cmd = name + " " + value;
+            RcResult r = ctx.rc.call_function(kKismetSystemLib, "ExecuteConsoleCommand",
+                                              json{{"Command", cmd}});
+            if (r.ok && !(r.body.is_object() && r.body.contains("errorMessage")))
+                return from_rc(r, json{{"applied", cmd}});
+            // UE4 world-context retry, mirroring ue_exec_console_command.
+            RcResult world = call_modern_then_legacy(ctx, kUnrealEditorSubsystem,
+                                                     kEditorLevelLib, "GetEditorWorld");
+            if (world.ok && world.body.is_object() &&
+                world.body.contains("ReturnValue") &&
+                world.body["ReturnValue"].is_string()) {
+                RcResult r2 = ctx.rc.call_function(
+                    kKismetSystemLib, "ExecuteConsoleCommand",
+                    json{{"WorldContextObject", world.body["ReturnValue"]}, {"Command", cmd}});
+                if (r2.ok) return from_rc(r2, json{{"applied", cmd}});
+            }
+            return from_rc(r);
+        }});
+
+    // -- ue_start_pie ---------------------------------------------------------
+    add(Tool{
+        "ue_start_pie",
+        "Start a Play-In-Editor session (LevelEditorSubsystem."
+        "EditorRequestBeginPlay). UE 5.5+ only; returns 'unsupported' on earlier "
+        "engines. Use ue_stop_pie to end it.",
+        json{{"type", "object"}, {"properties", json::object()}},
+        {Capability::PieControl},
+        [](ToolContext& ctx, const json&) -> ToolResult {
+            const EngineVersion& v = ctx.caps.engine_version();
+            if (v.known() && !v.at_least(5, 5)) {
+                return ToolResult::unsupported(
+                    "EditorRequestBeginPlay requires UE 5.5+",
+                    json{{"engineVersion", v.raw}});
+            }
+            return from_rc(ctx.rc.call_function(kLevelEditorSubsystem,
+                                                "EditorRequestBeginPlay"));
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 — blueprint + UMG authoring. These are the creation tasks pure
+// RemoteControl can't express (the login-screen failure): building an asset's
+// internal structure. Each is a single Python recipe (one ExecutePythonCommandEx
+// round-trip) rather than the agent driving the editor one statement at a time.
+//
+// ue_create_widget_blueprint is deliberately MULTI-STRATEGY: setting a Widget
+// Blueprint's root widget hits a wall on stripped Python builds (WidgetTree has
+// no binding; RootWidget is C++ protected). We try the clean path first, then
+// progressively fall back, and if all fail we return a structured 'unsupported'
+// that names the Layer-3 in-engine plugin — we never loop forever.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_authoring_tools() {
+    // -- ue_create_blueprint --------------------------------------------------
+    add(Tool{
+        "ue_create_blueprint",
+        "Create a Blueprint class asset. Pass name, packagePath (e.g. "
+        "\"/Game/Blueprints\"), and parentClass (a class path or name, default "
+        "\"/Script/Engine.Actor\"). Returns the created asset path. Python recipe; "
+        "requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"name", {{"type", "string"}}},
+               {"packagePath", {{"type", "string"}}},
+               {"parentClass", {{"type", "string"}, {"description", "default /Script/Engine.Actor"}}}}},
+             {"required", json::array({"name", "packagePath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+name = _ARGS['name']
+pkg = _ARGS['packagePath']
+parent_path = _ARGS.get('parentClass') or '/Script/Engine.Actor'
+parent = unreal.load_object(None, parent_path) if parent_path.startswith('/') else None
+if parent is None:
+    try:
+        parent = getattr(unreal, parent_path)
+    except Exception:
+        parent = unreal.Actor
+factory = unreal.BlueprintFactory()
+factory.set_editor_property('parent_class', parent)
+tools = unreal.AssetToolsHelpers.get_asset_tools()
+bp = tools.create_asset(name, pkg, unreal.Blueprint, factory)
+if bp is None:
+    _emit({'ok': False, 'error': 'create_asset returned None'})
+else:
+    unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+    _emit({'ok': True, 'assetPath': bp.get_path_name()})
+)PY";
+            if (arg_str(args, "name").empty() || arg_str(args, "packagePath").empty())
+                return ToolResult::error("name and packagePath are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_add_blueprint_variable -------------------------------------------
+    add(Tool{
+        "ue_add_blueprint_variable",
+        "Add a member variable to a Blueprint. Pass blueprintPath, variableName, "
+        "and variableType (a friendly name: bool, int, float, string, vector, "
+        "rotator, or an object/class path for object refs). isInstanceEditable "
+        "exposes it in the details panel. Python recipe; requires "
+        "PythonScriptPlugin and BlueprintEditorLibrary (UE5).",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"variableName", {{"type", "string"}}},
+               {"variableType", {{"type", "string"}}},
+               {"isInstanceEditable", {{"type", "boolean"}}}}},
+             {"required", json::array({"blueprintPath", "variableName", "variableType"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if bp is None:
+    _emit({'ok': False, 'error': 'could not load blueprint'})
+else:
+    vname = _ARGS['variableName']
+    vtype = _ARGS['variableType']
+    prim = {
+        'bool': unreal.EdGraphPinType('bool'),
+        'int': unreal.EdGraphPinType('int'),
+        'float': unreal.EdGraphPinType('real', sub_category='double') if hasattr(unreal,'EdGraphPinType') else None,
+        'string': unreal.EdGraphPinType('string'),
+    }
+    if not hasattr(unreal, 'BlueprintEditorLibrary'):
+        _emit({'ok': False, 'error': 'BlueprintEditorLibrary unavailable on this engine (UE5+ only)'})
+    else:
+        try:
+            pin = unreal.EdGraphPinType(vtype)
+        except Exception:
+            pin = unreal.EdGraphPinType('bool')
+        unreal.BlueprintEditorLibrary.add_member_variable(bp, vname, pin)
+        if _ARGS.get('isInstanceEditable'):
+            try:
+                unreal.BlueprintEditorLibrary.set_blueprint_variable_instance_editable(bp, vname, True)
+            except Exception:
+                pass
+        unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+        unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+        _emit({'ok': True, 'variable': vname, 'type': vtype})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() ||
+                arg_str(args, "variableName").empty() ||
+                arg_str(args, "variableType").empty())
+                return ToolResult::error("blueprintPath, variableName and variableType are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_compile_blueprint -------------------------------------------------
+    add(Tool{
+        "ue_compile_blueprint",
+        "Compile and save a Blueprint. Pass blueprintPath. Python recipe; "
+        "requires PythonScriptPlugin and BlueprintEditorLibrary (UE5).",
+        json{{"type", "object"},
+             {"properties", {{"blueprintPath", {{"type", "string"}}}}},
+             {"required", json::array({"blueprintPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if bp is None:
+    _emit({'ok': False, 'error': 'could not load blueprint'})
+elif not hasattr(unreal, 'BlueprintEditorLibrary'):
+    _emit({'ok': False, 'error': 'BlueprintEditorLibrary unavailable (UE5+ only)'})
+else:
+    unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+    unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+    _emit({'ok': True, 'compiled': _ARGS['blueprintPath']})
+)PY";
+            if (arg_str(args, "blueprintPath").empty())
+                return ToolResult::error("blueprintPath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_create_widget_blueprint (MULTI-STRATEGY) -------------------------
+    add(Tool{
+        "ue_create_widget_blueprint",
+        "Create a UMG Widget Blueprint WITH a root panel — the task that fails "
+        "via naive scripting because WidgetTree often has no Python binding and "
+        "RootWidget is C++ protected. This recipe tries several strategies in "
+        "order (factory root_widget_class, construct_widget on the tree, then "
+        "set_editor_property) and reports which one worked in strategiesTried. "
+        "Pass name, packagePath, and optional rootType (CanvasPanel default). If "
+        "every strategy fails it returns 'unsupported' pointing at the Layer-3 "
+        "in-engine plugin — it does NOT loop. Requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"name", {{"type", "string"}}},
+               {"packagePath", {{"type", "string"}}},
+               {"rootType", {{"type", "string"}, {"description", "CanvasPanel (default), VerticalBox, Overlay, ..."}}}}},
+             {"required", json::array({"name", "packagePath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+name = _ARGS['name']
+pkg = _ARGS['packagePath']
+root_type = _ARGS.get('rootType') or 'CanvasPanel'
+tried = []
+root_cls = getattr(unreal, root_type, unreal.CanvasPanel)
+
+# Build the factory; some builds expose parent_class / root_widget_class.
+factory = unreal.WidgetBlueprintFactory()
+try:
+    factory.set_editor_property('parent_class', unreal.UserWidget)
+except Exception as e:
+    tried.append('set parent_class failed: %s' % e)
+
+tools = unreal.AssetToolsHelpers.get_asset_tools()
+wbp = tools.create_asset(name, pkg, unreal.WidgetBlueprint, factory)
+if wbp is None:
+    _emit({'ok': False, 'error': 'create_asset returned None', 'strategiesTried': tried})
+else:
+    have_root = False
+    # Inspect the existing tree/root if any.
+    try:
+        tree = wbp.get_editor_property('widget_tree')
+    except Exception as e:
+        tree = None
+        tried.append('get widget_tree failed: %s' % e)
+
+    # Strategy A: construct_widget on the tree and assign as root_widget.
+    if tree is not None and not have_root:
+        try:
+            existing = tree.get_editor_property('root_widget')
+            if existing is not None:
+                have_root = True
+                tried.append('A: already had root %s' % type(existing).__name__)
+        except Exception:
+            pass
+    if tree is not None and not have_root:
+        try:
+            w = tree.construct_widget(root_cls)
+            tree.set_editor_property('root_widget', w)
+            have_root = True
+            tried.append('A: construct_widget+set root_widget OK')
+        except Exception as e:
+            tried.append('A failed: %s' % e)
+
+    # Strategy B: load UMGEditor module then retry construct_widget.
+    if tree is not None and not have_root:
+        try:
+            unreal.load_module('UMGEditor')
+            w = tree.construct_widget(root_cls)
+            tree.set_editor_property('root_widget', w)
+            have_root = True
+            tried.append('B: load_module(UMGEditor)+construct OK')
+        except Exception as e:
+            tried.append('B failed: %s' % e)
+
+    # Persist whatever we achieved.
+    try:
+        if hasattr(unreal, 'BlueprintEditorLibrary'):
+            unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
+    except Exception as e:
+        tried.append('compile failed: %s' % e)
+    unreal.EditorAssetLibrary.save_asset(wbp.get_path_name())
+
+    _emit({'ok': have_root, 'assetPath': wbp.get_path_name(),
+           'rootSet': have_root, 'strategiesTried': tried,
+           'error': '' if have_root else 'created the asset but could not set a root widget via Python (WidgetTree/RootWidget restricted on this build); use the Layer-3 in-engine plugin'})
+)PY";
+            if (arg_str(args, "name").empty() || arg_str(args, "packagePath").empty())
+                return ToolResult::error("name and packagePath are required");
+            ToolResult r = run_python_recipe(ctx, kRecipe, args);
+            // If the recipe created the asset but couldn't set a root, surface it
+            // as a structured 'unsupported' (not a hard error) so the agent stops
+            // rather than retrying — and still learns the asset path.
+            if (r.is_error && r.payload.is_object() &&
+                r.payload.value("rootSet", true) == false) {
+                json extra = r.payload;
+                extra.erase("status");
+                extra.erase("error");
+                return ToolResult::unsupported(
+                    "Widget Blueprint created but root widget could not be set via "
+                    "Python on this build; see strategiesTried. A Layer-3 in-engine "
+                    "plugin is required to author the root.",
+                    std::move(extra));
+            }
+            return r;
+        }});
+
+    // -- ue_add_widget_to_blueprint ------------------------------------------
+    add(Tool{
+        "ue_add_widget_to_blueprint",
+        "Add a child widget (Button, TextBlock, EditableTextBox, Image, "
+        "VerticalBox, ...) to a Widget Blueprint's root/tree. Pass blueprintPath, "
+        "widgetType, and widgetName. Optional text (for text-bearing widgets) and "
+        "addToRoot (default true). Returns the new widget name. Requires the "
+        "blueprint to already have a root panel (see ue_create_widget_blueprint). "
+        "Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"widgetType", {{"type", "string"}}},
+               {"widgetName", {{"type", "string"}}},
+               {"text", {{"type", "string"}}}}},
+             {"required", json::array({"blueprintPath", "widgetType", "widgetName"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+wbp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if wbp is None:
+    _emit({'ok': False, 'error': 'could not load widget blueprint'})
+else:
+    wtype = _ARGS['widgetType']
+    wname = _ARGS['widgetName']
+    cls = getattr(unreal, wtype, None)
+    if cls is None:
+        _emit({'ok': False, 'error': 'unknown widget type: %s' % wtype})
+    else:
+        tree = wbp.get_editor_property('widget_tree')
+        child = tree.construct_widget(cls, wname)
+        root = tree.get_editor_property('root_widget')
+        added = False
+        if root is not None and hasattr(root, 'add_child'):
+            try:
+                root.add_child(child)
+                added = True
+            except Exception as e:
+                added = False
+        txt = _ARGS.get('text')
+        if txt is not None:
+            try:
+                child.set_text(unreal.Text(txt))
+            except Exception:
+                try:
+                    child.set_editor_property('text', unreal.Text(txt))
+                except Exception:
+                    pass
+        if hasattr(unreal, 'BlueprintEditorLibrary'):
+            unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
+        unreal.EditorAssetLibrary.save_asset(wbp.get_path_name())
+        _emit({'ok': True, 'widget': wname, 'type': wtype, 'addedToRoot': added})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() ||
+                arg_str(args, "widgetType").empty() ||
+                arg_str(args, "widgetName").empty())
+                return ToolResult::error("blueprintPath, widgetType and widgetName are required");
+            return run_python_recipe(ctx, kRecipe, args);
         }});
 }
 

@@ -153,7 +153,7 @@ You can start the CLI before the editor — the server connects lazily (see
 
 ## Tools
 
-61 tools, grouped below. Every tool is **capability-gated**: if the connected
+82 tools, grouped below. Every tool is **capability-gated**: if the connected
 engine lacks the required capability it returns
 `{"status":"unsupported", "reason": ..., "missingCapability": ...}` instead of
 failing. Tools marked *modern→legacy* call the UE5 editor subsystem first and
@@ -251,6 +251,73 @@ rather than a show/hide-and-screenshot search.
 | `ue_focus_viewport_on_actor` | object.call | Frame the viewport camera on an actor using its bounds |
 | `ue_set_game_view` | object.call | Toggle viewport Game View (*modern→legacy*) |
 | `ue_get_console_variable` | object.call | Read a CVar value (float / int / bool / string) |
+
+### Scene authoring (Layer 1)
+
+Build and organize scenes faster — batch spawning avoids the per-actor latency
+that makes "build a town" painful.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_batch_spawn_actors` | batch (4.26+) | Spawn many actors in one `/remote/batch` round-trip |
+| `ue_duplicate_actor` | object.call | Duplicate a level actor with an optional offset (*modern→legacy*) |
+| `ue_attach_actor` / `ue_detach_actor` | object.call | Parent / unparent actors (`K2_AttachToActor` / `K2_DetachFromActor`) |
+| `ue_set_actor_folder` | object.property | Set an actor's World Outliner folder path |
+
+### Mesh & lighting (Layer 1)
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_set_static_mesh` | object.call | Swap a StaticMeshComponent's mesh asset |
+| `ue_set_actor_material` | object.call | Assign a material **asset** to a component's slot (`SetMaterial`) |
+| `ue_set_light_property` | object.call | Set a LightComponent's intensity and/or color |
+
+### Asset & material creation (Layer 1)
+
+Python recipes — each runs as one `ExecutePythonCommandEx` round-trip, not a
+sequence of REPL calls. Require the PythonScriptPlugin.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_create_material` | python | Create a Material asset (optional constant base color) |
+| `ue_create_material_instance` | python | Create a Material Instance Constant parented to a material |
+| `ue_import_asset` | python | Import a source file (FBX/OBJ/PNG/…) via `AssetImportTask` |
+| `ue_create_folder` | python | Create a content-browser folder |
+
+### Data & debug (Layer 1)
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_data_table_get_rows` | python | Read a DataTable's rows + names as JSON |
+| `ue_set_cvar` | object.call | **Write** a console variable (counterpart to `ue_get_console_variable`) |
+| `ue_start_pie` | pie.control (5.5+) | Start a Play-In-Editor session (`EditorRequestBeginPlay`) |
+
+### Blueprint & UMG authoring (Layer 2)
+
+Creation tasks pure RemoteControl can't express — building an asset's internal
+structure. Python recipes; require the PythonScriptPlugin (and
+`BlueprintEditorLibrary`, UE5, for the blueprint tools).
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_create_blueprint` | python | Create a Blueprint class asset with a chosen parent |
+| `ue_add_blueprint_variable` | python | Add a member variable (UE5 `BlueprintEditorLibrary`) |
+| `ue_compile_blueprint` | python | Compile and save a Blueprint |
+| `ue_create_widget_blueprint` | python | Create a UMG Widget Blueprint **with a root panel** — tries several strategies and reports `strategiesTried`; returns `unsupported` (pointing at the Layer-3 plugin) on stripped builds where the root can't be set, rather than looping |
+| `ue_add_widget_to_blueprint` | python | Add a child widget (Button / TextBlock / EditableTextBox / …) to a Widget Blueprint's root |
+
+> **UMG note (empirically confirmed on UE 5.5):** setting a Widget Blueprint's
+> *root* widget is the one creation task that can't be done from outside the
+> engine. `UWidgetTree` has no Python type binding (even after
+> `load_module("UMG"/"UMGEditor")`), and `WidgetTree.RootWidget` carries the
+> `EditConst` flag — so Python's `set_editor_property` AND the RemoteControl
+> write path (even with `bIgnoreProtectedCheck`) both refuse it. RC *can* read
+> the protected WidgetTree and `new_object(CanvasPanel, tree)` *can* create a
+> panel, but the final assignment is blocked. `ue_create_widget_blueprint` is
+> honest about this: it creates the asset, tries each path, reports
+> `strategiesTried`, and returns `unsupported` — it does NOT loop (the failure
+> mode that cost 27 minutes). Authoring the root needs the optional Layer-3
+> in-engine plugin (see `.omc/plans/layer3-inengine-plugin-design.md`).
 
 The one-click setup command enables the stock engine plugins needed by these
 helpers. If configuring manually, enable `RemoteControl`,

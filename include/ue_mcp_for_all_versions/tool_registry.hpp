@@ -102,6 +102,16 @@ private:
     void register_material_tools();
     // Editor workflow + convenience tools: undo/redo, spawn-from-asset, etc.
     void register_workflow_tools();
+    // Layer 1: scene/actor authoring (batch spawn, duplicate, attach, folders).
+    void register_scene_tools();
+    // Layer 1: mesh + lighting edits (static mesh swap, materials, light props).
+    void register_mesh_light_tools();
+    // Layer 1: asset/material creation + import (Python recipes).
+    void register_creation_tools();
+    // Layer 1: data table read/write + extra debug (cvar write, log, PIE start).
+    void register_data_debug_tools();
+    // Layer 2: blueprint + UMG authoring (Python recipes; multi-strategy).
+    void register_authoring_tools();
 
     std::vector<Tool> tools_;
 };

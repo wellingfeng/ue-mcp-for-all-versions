@@ -145,6 +145,27 @@ static void test_mcp_dispatch() {
         CHECK(has_tool("ue_spawn_actor_from_asset"));
         CHECK(has_tool("ue_focus_viewport_on_actor"));
         CHECK(has_tool("ue_get_console_variable"));
+        // Layer 1: scene / mesh / light / creation / data-debug tools.
+        CHECK(has_tool("ue_batch_spawn_actors"));
+        CHECK(has_tool("ue_duplicate_actor"));
+        CHECK(has_tool("ue_attach_actor"));
+        CHECK(has_tool("ue_set_actor_folder"));
+        CHECK(has_tool("ue_set_static_mesh"));
+        CHECK(has_tool("ue_set_actor_material"));
+        CHECK(has_tool("ue_set_light_property"));
+        CHECK(has_tool("ue_create_material"));
+        CHECK(has_tool("ue_create_material_instance"));
+        CHECK(has_tool("ue_import_asset"));
+        CHECK(has_tool("ue_create_folder"));
+        CHECK(has_tool("ue_data_table_get_rows"));
+        CHECK(has_tool("ue_set_cvar"));
+        CHECK(has_tool("ue_start_pie"));
+        // Layer 2: blueprint + UMG authoring tools.
+        CHECK(has_tool("ue_create_blueprint"));
+        CHECK(has_tool("ue_add_blueprint_variable"));
+        CHECK(has_tool("ue_compile_blueprint"));
+        CHECK(has_tool("ue_create_widget_blueprint"));
+        CHECK(has_tool("ue_add_widget_to_blueprint"));
     }
 
     // unknown method -> -32601
@@ -243,6 +264,27 @@ static void test_tool_degradation() {
         CHECK(thumb.payload["status"] == "unsupported");
         CHECK(thumb.payload["missingCapability"] == "object.thumbnail");
 
+        // Layer-2 creation recipes are Python-gated: on a 4.25 registry without
+        // PythonScripting they degrade to 'unsupported', not error.
+        for (const char* t : {"ue_create_material", "ue_create_blueprint",
+                              "ue_create_widget_blueprint", "ue_import_asset"}) {
+            auto r = tools.invoke(ctx, t, json{{"name", "X"}, {"packagePath", "/Game"}});
+            CHECK(!r.is_error);
+            CHECK(r.payload["status"] == "unsupported");
+            CHECK(r.payload["missingCapability"] == "python");
+        }
+
+        // ue_start_pie is PieControl-gated -> unsupported on 4.25.
+        auto startpie = tools.invoke(ctx, "ue_start_pie", json::object());
+        CHECK(!startpie.is_error);
+        CHECK(startpie.payload["status"] == "unsupported");
+
+        // Batch spawn needs the batch route (4.26+) -> unsupported on 4.25.
+        auto bspawn = tools.invoke(ctx, "ue_batch_spawn_actors",
+                                   json{{"actors", json::array()}});
+        CHECK(!bspawn.is_error);
+        CHECK(bspawn.payload["status"] == "unsupported");
+
         // Scene introspection only needs object.call -> reaches handler, which
         // then reports the connection is down (not "unsupported").
         auto find = tools.invoke(ctx, "ue_find_actors_by_class",
@@ -271,6 +313,13 @@ static void test_tool_degradation() {
         CHECK(py.payload["status"] == "error");  // gate passed; RC not connected
         auto pie = tools.invoke(ctx, "ue_is_pie", json::object());
         CHECK(pie.payload["status"] == "error");
+
+        // A Python-gated creation recipe passes the capability gate on 5.5+Python
+        // and reaches the handler, which then fails on no connection (not
+        // 'unsupported').
+        auto mat = tools.invoke(ctx, "ue_create_material",
+                                json{{"name", "M"}, {"packagePath", "/Game"}});
+        CHECK(mat.payload["status"] == "error");  // gate passed; RC not connected
     }
 }
 
