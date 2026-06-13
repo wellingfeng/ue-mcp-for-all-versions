@@ -98,6 +98,9 @@ private:
     // Scene introspection tools: find-by-class/label, components, bounds. These
     // let an agent query the scene directly instead of guessing visually.
     void register_introspection_tools();
+    // Component-level transform/bounds, Blueprint component templates, character
+    // mesh normalization, and PIE input helpers.
+    void register_component_tools();
     // Material + visual tools: dynamic material params, object thumbnails.
     void register_material_tools();
     // Editor workflow + convenience tools: undo/redo, spawn-from-asset, etc.

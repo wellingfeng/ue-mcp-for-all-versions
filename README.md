@@ -153,7 +153,7 @@ You can start the CLI before the editor — the server connects lazily (see
 
 ## Tools
 
-82 tools, grouped below. Every tool is **capability-gated**: if the connected
+104 tools, grouped below. Every tool is **capability-gated**: if the connected
 engine lacks the required capability it returns
 `{"status":"unsupported", "reason": ..., "missingCapability": ...}` instead of
 failing. Tools marked *modern→legacy* call the UE5 editor subsystem first and
@@ -233,6 +233,22 @@ rather than a show/hide-and-screenshot search.
 | `ue_get_actor_bounds` | object.call | World-space bounding box (origin + extent) |
 | `ue_get_actor_reference` | object.call | Resolve an actor path/name to a concrete reference (UE5) |
 
+### Component transforms, bounds & character scale
+
+Component-level tools for adjusting Pawn internals such as a `HeroineMesh`,
+camera, or spring arm without moving the whole actor. Python-backed read helpers
+return normalized JSON instead of raw UE structs.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_set_component_relative_transform` | object.call | Set a child SceneComponent's relative location / rotation / scale (`K2_SetRelativeLocation`, `K2_SetRelativeRotation`, `SetRelativeScale3D`) |
+| `ue_get_component_transform` | python | Read component world transform, relative transform, attach parent, owner, class, and world scale |
+| `ue_get_component_bounds` | python | Read local/world component bounds, or aggregate filtered actor bounds; defaults `includeEditorVisualization=false` to exclude camera frustums, billboards, arrows, sprites, and editor-only components |
+| `ue_fit_mesh_component_to_height` | python | Read StaticMesh/SkeletalMesh local bounds, compute uniform scale for a target height such as 180, and optionally apply it |
+| `ue_normalize_imported_character_mesh` | python | Suggest rotation and optional scale for common imported character axis conventions, defaulting to Unreal `targetUp=Z`, `targetForward=X`; can optionally apply to a component |
+| `ue_get_blueprint_components` | python | List a Blueprint generated CDO's component tree: name, class, parent, relative transform, and common resource references |
+| `ue_set_blueprint_component_template_transform` | python | Persistently edit a Blueprint component template on the generated CDO and exposed SCS template, for defaults such as `BP_HeroineThirdPersonPawn.HeroineMesh` |
+
 ### Materials & visuals
 
 | Tool | Requires | Description |
@@ -282,6 +298,7 @@ sequence of REPL calls. Require the PythonScriptPlugin.
 | `ue_create_material` | python | Create a Material asset (optional constant base color) |
 | `ue_create_material_instance` | python | Create a Material Instance Constant parented to a material |
 | `ue_import_asset` | python | Import a source file (FBX/OBJ/PNG/…) via `AssetImportTask` |
+| `ue_import_asset_with_transform_policy` | python | Import FBX/GLB/glTF with explicit convertScene, forceFrontXAxis, convertSceneUnit, importUniformScale, skeletal/static mesh import-data overrides, and material/texture flags where exposed by the engine |
 | `ue_create_folder` | python | Create a content-browser folder |
 
 ### Data & debug (Layer 1)
@@ -291,8 +308,9 @@ sequence of REPL calls. Require the PythonScriptPlugin.
 | `ue_data_table_get_rows` | python | Read a DataTable's rows + names as JSON |
 | `ue_set_cvar` | object.call | **Write** a console variable (counterpart to `ue_get_console_variable`) |
 | `ue_start_pie` | pie.control (5.5+) | Start a Play-In-Editor session (`EditorRequestBeginPlay`) |
+| `ue_simulate_player_input` | python + pie.control | Inject key/axis input into the PIE PlayerController and report pawn movement delta, with an explicit AddMovementInput fallback when Python does not expose low-level input calls |
 
-### Blueprint & UMG authoring (Layer 2)
+### Blueprint, gameplay & UMG authoring (Layer 2)
 
 Creation tasks pure RemoteControl can't express — building an asset's internal
 structure. Python recipes; require the PythonScriptPlugin (and
@@ -303,8 +321,21 @@ structure. Python recipes; require the PythonScriptPlugin (and
 | `ue_create_blueprint` | python | Create a Blueprint class asset with a chosen parent |
 | `ue_add_blueprint_variable` | python | Add a member variable (UE5 `BlueprintEditorLibrary`) |
 | `ue_compile_blueprint` | python | Compile and save a Blueprint |
+| `ue_create_character_blueprint` | python | Create a `Character` Blueprint, configure capsule / mesh / `CharacterMovement`, and try to add a SpringArm + Camera |
+| `ue_configure_character_movement` | python | Configure an existing Character Blueprint for grounded walking, gravity, jump, step height, floor angle, capsule size, mesh transform, and optional Anim Blueprint |
+| `ue_calibrate_character_collision` | python | Calibrate capsule radius / half-height and mesh offset for a target character height, with Pawn / CharacterMesh collision profiles |
+| `ue_configure_third_person_camera` | python | Add or update a SpringArm + Camera for third-person follow, shoulder offset, collision testing, and camera lag |
+| `ue_create_enhanced_input_assets` | python | Create IA_Move / IA_Look / IA_Jump and an Input Mapping Context with WASD, mouse, SpaceBar, and common modifiers |
+| `ue_create_locomotion_animation_assets` | python | Create an Animation Blueprint and 1D speed BlendSpace scaffold for a skeleton, with optional idle/walk/run samples where Python exposes sample editing |
+| `ue_set_game_defaults` | python | Persist GameMapsSettings: game default map, editor startup map, and default GameMode |
+| `ue_validate_third_person_pie` | python + pie.control | PIE smoke test for Player0 pawn class, possession, CharacterMovement, camera, and movement-input displacement |
 | `ue_create_widget_blueprint` | python | Create a UMG Widget Blueprint **with a root panel** — tries several strategies and reports `strategiesTried`; returns `unsupported` (pointing at the Layer-3 plugin) on stripped builds where the root can't be set, rather than looping |
 | `ue_add_widget_to_blueprint` | python | Add a child widget (Button / TextBlock / EditableTextBox / …) to a Widget Blueprint's root |
+| `ue_inspect_widget_blueprint` | python | Inspect a Widget Blueprint tree: root, descendants, parent/child names, slot types, and common text/value properties |
+| `ue_add_widget_to_panel` | python | Add a widget to a named panel/content widget with optional text, properties, and layout in one call |
+| `ue_set_widget_properties` | python | Set common UMG properties such as text, tooltip, visibility, enabled state, opacity, font size, color, brush color, and image |
+| `ue_configure_widget_layout` | python | Configure CanvasPanelSlot position / size / anchors / alignment / z-order and common panel-slot padding/alignment |
+| `ue_create_widget_component_blueprint` | python | Create an Actor Blueprint with a WidgetComponent assigned to a UMG Widget Blueprint for world-space or screen-space UI |
 
 > **UMG note (empirically confirmed on UE 5.5):** setting a Widget Blueprint's
 > *root* widget is the one creation task that can't be done from outside the

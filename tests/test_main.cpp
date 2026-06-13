@@ -140,6 +140,15 @@ static void test_mcp_dispatch() {
         CHECK(has_tool("ue_find_actors_by_label"));
         CHECK(has_tool("ue_get_actor_components"));
         CHECK(has_tool("ue_get_actor_bounds"));
+        CHECK(has_tool("ue_set_component_relative_transform"));
+        CHECK(has_tool("ue_get_component_transform"));
+        CHECK(has_tool("ue_get_component_bounds"));
+        CHECK(has_tool("ue_fit_mesh_component_to_height"));
+        CHECK(has_tool("ue_get_blueprint_components"));
+        CHECK(has_tool("ue_set_blueprint_component_template_transform"));
+        CHECK(has_tool("ue_normalize_imported_character_mesh"));
+        CHECK(has_tool("ue_import_asset_with_transform_policy"));
+        CHECK(has_tool("ue_simulate_player_input"));
         CHECK(has_tool("ue_set_material_param"));
         CHECK(has_tool("ue_get_object_thumbnail"));
         CHECK(has_tool("ue_spawn_actor_from_asset"));
@@ -164,8 +173,21 @@ static void test_mcp_dispatch() {
         CHECK(has_tool("ue_create_blueprint"));
         CHECK(has_tool("ue_add_blueprint_variable"));
         CHECK(has_tool("ue_compile_blueprint"));
+        CHECK(has_tool("ue_create_character_blueprint"));
+        CHECK(has_tool("ue_configure_character_movement"));
+        CHECK(has_tool("ue_calibrate_character_collision"));
+        CHECK(has_tool("ue_configure_third_person_camera"));
+        CHECK(has_tool("ue_create_enhanced_input_assets"));
+        CHECK(has_tool("ue_create_locomotion_animation_assets"));
+        CHECK(has_tool("ue_set_game_defaults"));
+        CHECK(has_tool("ue_validate_third_person_pie"));
         CHECK(has_tool("ue_create_widget_blueprint"));
         CHECK(has_tool("ue_add_widget_to_blueprint"));
+        CHECK(has_tool("ue_inspect_widget_blueprint"));
+        CHECK(has_tool("ue_add_widget_to_panel"));
+        CHECK(has_tool("ue_set_widget_properties"));
+        CHECK(has_tool("ue_configure_widget_layout"));
+        CHECK(has_tool("ue_create_widget_component_blueprint"));
     }
 
     // unknown method -> -32601
@@ -267,7 +289,29 @@ static void test_tool_degradation() {
         // Layer-2 creation recipes are Python-gated: on a 4.25 registry without
         // PythonScripting they degrade to 'unsupported', not error.
         for (const char* t : {"ue_create_material", "ue_create_blueprint",
-                              "ue_create_widget_blueprint", "ue_import_asset"}) {
+                              "ue_create_character_blueprint",
+                              "ue_configure_character_movement",
+                              "ue_calibrate_character_collision",
+                              "ue_configure_third_person_camera",
+                              "ue_create_enhanced_input_assets",
+                              "ue_create_locomotion_animation_assets",
+                              "ue_set_game_defaults",
+                              "ue_validate_third_person_pie",
+                              "ue_create_widget_blueprint",
+                              "ue_inspect_widget_blueprint",
+                              "ue_add_widget_to_panel",
+                              "ue_set_widget_properties",
+                              "ue_configure_widget_layout",
+                              "ue_create_widget_component_blueprint",
+                              "ue_import_asset",
+                              "ue_get_component_transform",
+                              "ue_get_component_bounds",
+                              "ue_fit_mesh_component_to_height",
+                              "ue_get_blueprint_components",
+                              "ue_set_blueprint_component_template_transform",
+                              "ue_normalize_imported_character_mesh",
+                              "ue_import_asset_with_transform_policy",
+                              "ue_simulate_player_input"}) {
             auto r = tools.invoke(ctx, t, json{{"name", "X"}, {"packagePath", "/Game"}});
             CHECK(!r.is_error);
             CHECK(r.payload["status"] == "unsupported");

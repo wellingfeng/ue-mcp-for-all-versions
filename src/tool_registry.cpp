@@ -552,6 +552,7 @@ void ToolRegistry::register_builtins() {
     register_level_tools();
     register_rc_route_tools();
     register_introspection_tools();
+    register_component_tools();
     register_material_tools();
     register_workflow_tools();
     register_scene_tools();
@@ -1570,6 +1571,1334 @@ void ToolRegistry::register_introspection_tools() {
 }
 
 // ---------------------------------------------------------------------------
+// Component-level helpers. These cover the gap between actor-level transform
+// tools and authoring workflows that need to adjust a pawn's internal mesh,
+// camera, spring arm, or Blueprint component template.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_component_tools() {
+    // -- ue_set_component_relative_transform ---------------------------------
+    add(Tool{
+        "ue_set_component_relative_transform",
+        "Set a SceneComponent's relative transform. Pass componentPath plus any "
+        "of location {x,y,z}, rotation {pitch,yaw,roll}, and scale {x,y,z}. "
+        "Uses K2_SetRelativeLocation, K2_SetRelativeRotation, and "
+        "SetRelativeScale3D on the component instance, so it works for child "
+        "components such as SkeletalMeshComponent, CameraComponent, and "
+        "SpringArmComponent.",
+        json{{"type", "object"},
+             {"properties",
+              {{"componentPath", {{"type", "string"}}},
+               {"location", {{"type", "object"}}},
+               {"rotation", {{"type", "object"}}},
+               {"scale", {{"type", "object"}}},
+               {"sweep", {{"type", "boolean"}}},
+               {"teleport", {{"type", "boolean"}}}}},
+             {"required", json::array({"componentPath"})}},
+        {Capability::ObjectCall},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            const std::string comp = arg_str(args, "componentPath");
+            if (comp.empty()) return ToolResult::error("componentPath is required");
+            const bool sweep = args.value("sweep", false);
+            const bool teleport = args.value("teleport", true);
+            json applied = json::object();
+            json errors = json::object();
+
+            auto record = [&](const char* key, const RcResult& r) {
+                const bool body_error = r.body.is_object() && r.body.contains("errorMessage");
+                if (r.ok && !body_error) {
+                    applied[key] = "ok";
+                } else {
+                    std::string msg = r.error.empty() ? "RemoteControl request failed" : r.error;
+                    if (body_error && r.body["errorMessage"].is_string())
+                        msg = r.body["errorMessage"].get<std::string>();
+                    errors[key] = msg;
+                }
+            };
+
+            if (args.contains("location")) {
+                record("location",
+                       ctx.rc.call_function(comp, "K2_SetRelativeLocation",
+                                            json{{"NewLocation", xyz(args["location"])},
+                                                 {"bSweep", sweep},
+                                                 {"bTeleport", teleport}},
+                                            true));
+            }
+            if (args.contains("rotation")) {
+                record("rotation",
+                       ctx.rc.call_function(comp, "K2_SetRelativeRotation",
+                                            json{{"NewRotation", pyr(args["rotation"])},
+                                                 {"bSweep", sweep},
+                                                 {"bTeleport", teleport}},
+                                            true));
+            }
+            if (args.contains("scale")) {
+                record("scale",
+                       ctx.rc.call_function(comp, "SetRelativeScale3D",
+                                            json{{"NewScale3D", xyz(args["scale"], 1.0, 1.0, 1.0)}},
+                                            true));
+            }
+            if (applied.empty() && errors.empty())
+                return ToolResult::error("provide at least one of location, rotation, scale");
+            json payload = {{"status", errors.empty() ? "ok" : "error"},
+                            {"componentPath", comp},
+                            {"applied", applied}};
+            if (!errors.empty()) payload["errors"] = errors;
+            return errors.empty() ? ToolResult::ok(payload) : ToolResult{true, payload};
+        }});
+
+    // -- ue_get_component_transform ------------------------------------------
+    add(Tool{
+        "ue_get_component_transform",
+        "Read a SceneComponent's world transform, relative transform, attach "
+        "parent, owner, class, and world scale. componentPath should come from "
+        "ue_get_actor_components. Supports SkeletalMeshComponent, "
+        "CameraComponent, SpringArmComponent, and other SceneComponents. Python "
+        "recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties", {{"componentPath", {{"type", "string"}}}}},
+             {"required", json::array({"componentPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+path = _ARGS['componentPath']
+
+def resolve(path):
+    for fn_name in ('load_object', 'find_object'):
+        fn = getattr(unreal, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            obj = fn(None, path)
+            if obj is not None:
+                return obj
+        except Exception:
+            pass
+    return None
+
+def vdict(v):
+    return {'x': float(v.x), 'y': float(v.y), 'z': float(v.z)}
+
+def rdict(r):
+    return {'pitch': float(r.pitch), 'yaw': float(r.yaw), 'roll': float(r.roll)}
+
+def qdict(q):
+    return {'x': float(q.x), 'y': float(q.y), 'z': float(q.z), 'w': float(q.w)}
+
+def call_any(obj, names, default=None):
+    for name in names:
+        fn = getattr(obj, name, None)
+        if fn is not None:
+            try:
+                return fn()
+            except Exception:
+                pass
+    return default
+
+def prop_any(obj, names, default=None):
+    for name in names:
+        try:
+            return obj.get_editor_property(name)
+        except Exception:
+            pass
+    return default
+
+comp = resolve(path)
+if comp is None:
+    _emit({'ok': False, 'error': 'could not resolve componentPath: %s' % path})
+else:
+    world_location = call_any(comp, ['get_component_location'])
+    world_rotation = call_any(comp, ['get_component_rotation'])
+    world_scale = call_any(comp, ['get_component_scale'])
+    rel_location = call_any(comp, ['get_relative_location'], prop_any(comp, ['relative_location']))
+    rel_rotation = call_any(comp, ['get_relative_rotation'], prop_any(comp, ['relative_rotation']))
+    rel_scale = call_any(comp, ['get_relative_scale3d'], prop_any(comp, ['relative_scale3d']))
+    world_transform = call_any(comp, ['get_component_transform'])
+    parent = call_any(comp, ['get_attach_parent'], prop_any(comp, ['attach_parent']))
+    owner = call_any(comp, ['get_owner'])
+    attach_socket = call_any(comp, ['get_attach_socket_name'], '')
+
+    result = {
+        'ok': True,
+        'componentPath': comp.get_path_name(),
+        'componentName': comp.get_name(),
+        'classPath': comp.get_class().get_path_name(),
+        'ownerPath': owner.get_path_name() if owner is not None else '',
+        'attachParent': parent.get_path_name() if parent is not None else '',
+        'attachParentName': parent.get_name() if parent is not None else '',
+        'attachSocket': str(attach_socket),
+        'worldScale': vdict(world_scale) if world_scale is not None else None,
+        'worldTransform': {
+            'location': vdict(world_location) if world_location is not None else None,
+            'rotation': rdict(world_rotation) if world_rotation is not None else None,
+            'scale': vdict(world_scale) if world_scale is not None else None
+        },
+        'relativeTransform': {
+            'location': vdict(rel_location) if rel_location is not None else None,
+            'rotation': rdict(rel_rotation) if rel_rotation is not None else None,
+            'scale': vdict(rel_scale) if rel_scale is not None else None
+        }
+    }
+    if world_transform is not None:
+        try:
+            result['worldTransform']['quaternion'] = qdict(world_transform.rotation)
+        except Exception:
+            pass
+    _emit(result)
+)PY";
+            if (arg_str(args, "componentPath").empty())
+                return ToolResult::error("componentPath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_get_component_bounds --------------------------------------------
+    add(Tool{
+        "ue_get_component_bounds",
+        "Return local and/or world bounds for a component, or aggregate filtered "
+        "bounds for an actor when actorPath is supplied. By default "
+        "includeEditorVisualization=false excludes CameraComponent, "
+        "DrawFrustumComponent, BillboardComponent, ArrowComponent, SpriteComponent, "
+        "and editor-only components so camera frustums do not explode character "
+        "bounds. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"componentPath", {{"type", "string"}}},
+               {"actorPath", {{"type", "string"}}},
+               {"boundsSpace", {{"type", "string"}, {"enum", json::array({"both", "local", "world"})}}},
+               {"includeEditorVisualization", {{"type", "boolean"}}},
+               {"includePerComponent", {{"type", "boolean"}}}}},
+             {"required", json::array({})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+component_path = _ARGS.get('componentPath') or ''
+actor_path = _ARGS.get('actorPath') or ''
+bounds_space = _ARGS.get('boundsSpace') or 'both'
+include_visual = bool(_ARGS.get('includeEditorVisualization', False))
+include_per_component = bool(_ARGS.get('includePerComponent', True))
+
+VISUAL_CLASS_TOKENS = (
+    'CameraComponent', 'DrawFrustumComponent', 'BillboardComponent',
+    'ArrowComponent', 'SpriteComponent', 'TextRenderComponent'
+)
+
+def resolve(path):
+    for fn_name in ('load_object', 'find_object'):
+        fn = getattr(unreal, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            obj = fn(None, path)
+            if obj is not None:
+                return obj
+        except Exception:
+            pass
+    return None
+
+def vdict(v):
+    return {'x': float(v.x), 'y': float(v.y), 'z': float(v.z)}
+
+def vec(x, y, z):
+    return unreal.Vector(float(x), float(y), float(z))
+
+def bounds_dict(origin, extent, radius=None):
+    if origin is None or extent is None:
+        return None
+    d = {'origin': vdict(origin), 'extent': vdict(extent),
+         'min': vdict(vec(origin.x - extent.x, origin.y - extent.y, origin.z - extent.z)),
+         'max': vdict(vec(origin.x + extent.x, origin.y + extent.y, origin.z + extent.z))}
+    if radius is not None:
+        d['sphereRadius'] = float(radius)
+    return d
+
+def component_class_name(comp):
+    try:
+        return comp.get_class().get_name()
+    except Exception:
+        return type(comp).__name__
+
+def is_editor_only(comp):
+    for name in ('is_editor_only', 'is_editor_only_component'):
+        fn = getattr(comp, name, None)
+        if fn is not None:
+            try:
+                return bool(fn())
+            except Exception:
+                pass
+    for prop in ('is_editor_only', 'bIsEditorOnly'):
+        try:
+            return bool(comp.get_editor_property(prop))
+        except Exception:
+            pass
+    return False
+
+def is_visual_component(comp):
+    name = component_class_name(comp)
+    if any(token in name for token in VISUAL_CLASS_TOKENS):
+        return True
+    if is_editor_only(comp):
+        return True
+    return False
+
+def prop_any(obj, names):
+    for name in names:
+        try:
+            val = obj.get_editor_property(name)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+    return None
+
+def call_any(obj, names):
+    for name in names:
+        fn = getattr(obj, name, None)
+        if fn is not None:
+            try:
+                return fn()
+            except Exception:
+                pass
+    return None
+
+def mesh_asset(comp):
+    for name in ('get_static_mesh', 'get_skeletal_mesh_asset', 'get_skeletal_mesh'):
+        fn = getattr(comp, name, None)
+        if fn is not None:
+            try:
+                asset = fn()
+                if asset is not None:
+                    return asset
+            except Exception:
+                pass
+    return prop_any(comp, ('static_mesh', 'skeletal_mesh_asset', 'skeletal_mesh'))
+
+def local_bounds(comp):
+    glb = getattr(comp, 'get_local_bounds', None)
+    if glb is not None:
+        try:
+            lo, hi = glb()
+            origin = vec((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5, (lo.z + hi.z) * 0.5)
+            extent = vec(abs(hi.x - lo.x) * 0.5, abs(hi.y - lo.y) * 0.5, abs(hi.z - lo.z) * 0.5)
+            return origin, extent, None, 'component.get_local_bounds'
+        except Exception:
+            pass
+    asset = mesh_asset(comp)
+    if asset is not None:
+        for name in ('get_bounds', 'get_imported_bounds'):
+            fn = getattr(asset, name, None)
+            if fn is not None:
+                try:
+                    b = fn()
+                    return b.origin, b.box_extent, getattr(b, 'sphere_radius', None), 'asset.%s' % name
+                except Exception:
+                    pass
+        fn = getattr(asset, 'get_bounding_box', None)
+        if fn is not None:
+            try:
+                box = fn()
+                lo = box.min
+                hi = box.max
+                origin = vec((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5, (lo.z + hi.z) * 0.5)
+                extent = vec(abs(hi.x - lo.x) * 0.5, abs(hi.y - lo.y) * 0.5, abs(hi.z - lo.z) * 0.5)
+                return origin, extent, None, 'asset.get_bounding_box'
+            except Exception:
+                pass
+    return None, None, None, ''
+
+def world_bounds(comp):
+    for name in ('bounds', 'Bounds'):
+        try:
+            b = comp.get_editor_property(name)
+            return b.origin, b.box_extent, getattr(b, 'sphere_radius', None), 'component.bounds'
+        except Exception:
+            pass
+    origin, extent, radius, src = local_bounds(comp)
+    if origin is not None and extent is not None:
+        scale = call_any(comp, ('get_component_scale',))
+        loc = call_any(comp, ('get_component_location',))
+        if scale is not None and loc is not None:
+            e = vec(abs(extent.x * scale.x), abs(extent.y * scale.y), abs(extent.z * scale.z))
+            return loc, e, radius, 'local_bounds_scaled_fallback'
+    return None, None, None, ''
+
+def component_bounds_payload(comp):
+    excluded = (not include_visual) and is_visual_component(comp)
+    item = {
+        'componentPath': comp.get_path_name(),
+        'componentName': comp.get_name(),
+        'classPath': comp.get_class().get_path_name(),
+        'excluded': bool(excluded)
+    }
+    if excluded:
+        item['excludeReason'] = 'editor visualization component'
+        return item
+    if bounds_space in ('both', 'local'):
+        o, e, r, src = local_bounds(comp)
+        item['localBounds'] = bounds_dict(o, e, r)
+        item['localBoundsSource'] = src
+    if bounds_space in ('both', 'world'):
+        o, e, r, src = world_bounds(comp)
+        item['worldBounds'] = bounds_dict(o, e, r)
+        item['worldBoundsSource'] = src
+    return item
+
+def aggregate_world(items):
+    mins = []
+    maxs = []
+    for item in items:
+        b = item.get('worldBounds')
+        if not b:
+            continue
+        mins.append(b['min'])
+        maxs.append(b['max'])
+    if not mins:
+        return None
+    mn = {'x': min(v['x'] for v in mins), 'y': min(v['y'] for v in mins), 'z': min(v['z'] for v in mins)}
+    mx = {'x': max(v['x'] for v in maxs), 'y': max(v['y'] for v in maxs), 'z': max(v['z'] for v in maxs)}
+    origin = {'x': (mn['x'] + mx['x']) * 0.5, 'y': (mn['y'] + mx['y']) * 0.5, 'z': (mn['z'] + mx['z']) * 0.5}
+    extent = {'x': (mx['x'] - mn['x']) * 0.5, 'y': (mx['y'] - mn['y']) * 0.5, 'z': (mx['z'] - mn['z']) * 0.5}
+    return {'origin': origin, 'extent': extent, 'min': mn, 'max': mx}
+
+if not component_path and not actor_path:
+    _emit({'ok': False, 'error': 'componentPath or actorPath is required'})
+elif component_path:
+    comp = resolve(component_path)
+    if comp is None:
+        _emit({'ok': False, 'error': 'could not resolve componentPath: %s' % component_path})
+    else:
+        _emit({'ok': True, 'mode': 'component',
+               'includeEditorVisualization': include_visual,
+               'bounds': component_bounds_payload(comp)})
+else:
+    actor = resolve(actor_path)
+    if actor is None:
+        _emit({'ok': False, 'error': 'could not resolve actorPath: %s' % actor_path})
+    else:
+        try:
+            comps = list(actor.get_components_by_class(unreal.ActorComponent))
+        except Exception:
+            comps = []
+        items = [component_bounds_payload(c) for c in comps]
+        included = [i for i in items if not i.get('excluded')]
+        payload = {'ok': True, 'mode': 'actor', 'actorPath': actor.get_path_name(),
+                   'includeEditorVisualization': include_visual,
+                   'componentCount': len(items), 'includedComponentCount': len(included),
+                   'excludedComponentCount': len(items) - len(included),
+                   'worldBounds': aggregate_world(included)}
+        if include_per_component:
+            payload['components'] = items
+        _emit(payload)
+)PY";
+            if (arg_str(args, "componentPath").empty() &&
+                arg_str(args, "actorPath").empty()) {
+                return ToolResult::error("componentPath or actorPath is required");
+            }
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_fit_mesh_component_to_height -------------------------------------
+    add(Tool{
+        "ue_fit_mesh_component_to_height",
+        "Read a StaticMeshComponent or SkeletalMeshComponent asset's local "
+        "bounds, compute a uniform relative scale for a target height in UE "
+        "units (centimeters), and optionally apply it to the component. Useful "
+        "for AI-generated characters imported at 0.01, 1, 100, or 110 scale. "
+        "Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"componentPath", {{"type", "string"}}},
+               {"targetHeight", {{"type", "number"}}},
+               {"heightAxis", {{"type", "string"}, {"enum", json::array({"X", "Y", "Z"})}}},
+               {"apply", {{"type", "boolean"}}}}},
+             {"required", json::array({"componentPath", "targetHeight"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+path = _ARGS['componentPath']
+target = float(_ARGS['targetHeight'])
+axis = (_ARGS.get('heightAxis') or 'Z').upper()
+apply = bool(_ARGS.get('apply', True))
+
+def resolve(path):
+    for fn_name in ('load_object', 'find_object'):
+        fn = getattr(unreal, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            obj = fn(None, path)
+            if obj is not None:
+                return obj
+        except Exception:
+            pass
+    return None
+
+def vdict(v):
+    return {'x': float(v.x), 'y': float(v.y), 'z': float(v.z)}
+
+def prop_any(obj, names):
+    for name in names:
+        try:
+            val = obj.get_editor_property(name)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+    return None
+
+def mesh_asset(comp):
+    for name in ('get_static_mesh', 'get_skeletal_mesh_asset', 'get_skeletal_mesh'):
+        fn = getattr(comp, name, None)
+        if fn is not None:
+            try:
+                asset = fn()
+                if asset is not None:
+                    return asset
+            except Exception:
+                pass
+    return prop_any(comp, ('static_mesh', 'skeletal_mesh_asset', 'skeletal_mesh'))
+
+def local_min_max(comp):
+    glb = getattr(comp, 'get_local_bounds', None)
+    if glb is not None:
+        try:
+            return glb(), 'component.get_local_bounds'
+        except Exception:
+            pass
+    asset = mesh_asset(comp)
+    if asset is None:
+        return None, ''
+    for name in ('get_bounds', 'get_imported_bounds'):
+        fn = getattr(asset, name, None)
+        if fn is not None:
+            try:
+                b = fn()
+                lo = unreal.Vector(b.origin.x - b.box_extent.x,
+                                   b.origin.y - b.box_extent.y,
+                                   b.origin.z - b.box_extent.z)
+                hi = unreal.Vector(b.origin.x + b.box_extent.x,
+                                   b.origin.y + b.box_extent.y,
+                                   b.origin.z + b.box_extent.z)
+                return (lo, hi), 'asset.%s' % name
+            except Exception:
+                pass
+    fn = getattr(asset, 'get_bounding_box', None)
+    if fn is not None:
+        try:
+            box = fn()
+            return (box.min, box.max), 'asset.get_bounding_box'
+        except Exception:
+            pass
+    return None, ''
+
+comp = resolve(path)
+if comp is None:
+    _emit({'ok': False, 'error': 'could not resolve componentPath: %s' % path})
+else:
+    mm, source = local_min_max(comp)
+    if mm is None:
+        _emit({'ok': False, 'error': 'could not read mesh local bounds for component'})
+    else:
+        lo, hi = mm
+        local_height = abs(getattr(hi, axis.lower()) - getattr(lo, axis.lower()))
+        if local_height <= 0.000001:
+            _emit({'ok': False, 'error': 'mesh local height is zero on axis %s' % axis})
+        else:
+            uniform = target / local_height
+            prev = None
+            try:
+                prev = comp.get_relative_scale3d()
+            except Exception:
+                try:
+                    prev = comp.get_editor_property('relative_scale3d')
+                except Exception:
+                    prev = unreal.Vector(1.0, 1.0, 1.0)
+            applied = False
+            if apply:
+                new_scale = unreal.Vector(uniform, uniform, uniform)
+                try:
+                    comp.set_relative_scale3d(new_scale)
+                    applied = True
+                except Exception:
+                    comp.set_editor_property('relative_scale3d', new_scale)
+                    applied = True
+            _emit({'ok': True, 'componentPath': comp.get_path_name(),
+                   'meshPath': mesh_asset(comp).get_path_name() if mesh_asset(comp) is not None else '',
+                   'boundsSource': source,
+                   'heightAxis': axis,
+                   'localHeight': local_height,
+                   'targetHeight': target,
+                   'uniformScale': uniform,
+                   'previousRelativeScale': vdict(prev),
+                   'newRelativeScale': {'x': uniform, 'y': uniform, 'z': uniform},
+                   'applied': applied})
+)PY";
+            if (arg_str(args, "componentPath").empty() || !args.contains("targetHeight"))
+                return ToolResult::error("componentPath and targetHeight are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_get_blueprint_components -----------------------------------------
+    add(Tool{
+        "ue_get_blueprint_components",
+        "Load a Blueprint asset and list its component tree from the generated "
+        "CDO: component name, class, parent component, relative transform, and "
+        "common asset references such as StaticMesh, SkeletalMesh, AnimClass, "
+        "and materials. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties", {{"blueprintPath", {{"type", "string"}}}}},
+             {"required", json::array({"blueprintPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp_path = _ARGS['blueprintPath']
+bp = unreal.EditorAssetLibrary.load_asset(bp_path)
+
+def vdict(v):
+    return {'x': float(v.x), 'y': float(v.y), 'z': float(v.z)}
+
+def rdict(r):
+    return {'pitch': float(r.pitch), 'yaw': float(r.yaw), 'roll': float(r.roll)}
+
+def call_any(obj, names, default=None):
+    for name in names:
+        fn = getattr(obj, name, None)
+        if fn is not None:
+            try:
+                return fn()
+            except Exception:
+                pass
+    return default
+
+def prop_any(obj, names, default=None):
+    for name in names:
+        try:
+            val = obj.get_editor_property(name)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+    return default
+
+def obj_path(obj):
+    try:
+        return obj.get_path_name() if obj is not None else ''
+    except Exception:
+        return str(obj) if obj is not None else ''
+
+def generated_class(asset):
+    try:
+        return asset.get_editor_property('generated_class')
+    except Exception:
+        return getattr(asset, 'generated_class', None)
+
+def rel_transform(comp):
+    loc = call_any(comp, ['get_relative_location'], prop_any(comp, ['relative_location']))
+    rot = call_any(comp, ['get_relative_rotation'], prop_any(comp, ['relative_rotation']))
+    scale = call_any(comp, ['get_relative_scale3d'], prop_any(comp, ['relative_scale3d']))
+    return {'location': vdict(loc) if loc is not None else None,
+            'rotation': rdict(rot) if rot is not None else None,
+            'scale': vdict(scale) if scale is not None else None}
+
+def resource_refs(comp):
+    refs = {}
+    for key, names in {
+        'staticMesh': ('static_mesh',),
+        'skeletalMesh': ('skeletal_mesh_asset', 'skeletal_mesh'),
+        'animClass': ('anim_class', 'anim_instance_class'),
+        'cameraFilmback': ('filmback',)
+    }.items():
+        val = prop_any(comp, names)
+        if val is not None:
+            refs[key] = obj_path(val)
+    for method_key, method_name in (('staticMesh', 'get_static_mesh'),
+                                    ('skeletalMesh', 'get_skeletal_mesh_asset')):
+        fn = getattr(comp, method_name, None)
+        if fn is not None and method_key not in refs:
+            try:
+                refs[method_key] = obj_path(fn())
+            except Exception:
+                pass
+    mats = []
+    get_num = getattr(comp, 'get_num_materials', None)
+    get_mat = getattr(comp, 'get_material', None)
+    if get_num is not None and get_mat is not None:
+        try:
+            for i in range(int(get_num())):
+                mats.append(obj_path(get_mat(i)))
+        except Exception:
+            pass
+    if mats:
+        refs['materials'] = mats
+    extras = {}
+    for key in ('target_arm_length', 'socket_offset', 'target_offset',
+                'use_pawn_control_rotation', 'field_of_view', 'aspect_ratio'):
+        val = prop_any(comp, (key,))
+        if val is not None:
+            if hasattr(val, 'x') and hasattr(val, 'y') and hasattr(val, 'z'):
+                extras[key] = vdict(val)
+            else:
+                try:
+                    extras[key] = float(val)
+                except Exception:
+                    extras[key] = str(val)
+    if extras:
+        refs['settings'] = extras
+    return refs
+
+if bp is None:
+    _emit({'ok': False, 'error': 'could not load blueprint: %s' % bp_path})
+else:
+    gen = generated_class(bp)
+    if gen is None:
+        _emit({'ok': False, 'error': 'blueprint has no generated_class: %s' % bp_path})
+    else:
+        cdo = unreal.get_default_object(gen)
+        try:
+            comps = list(cdo.get_components_by_class(unreal.ActorComponent))
+        except Exception:
+            comps = []
+        items = []
+        for comp in comps:
+            parent = call_any(comp, ['get_attach_parent'], prop_any(comp, ['attach_parent']))
+            children = []
+            for other in comps:
+                other_parent = call_any(other, ['get_attach_parent'], prop_any(other, ['attach_parent']))
+                if other_parent is comp:
+                    children.append(other.get_name())
+            items.append({
+                'name': comp.get_name(),
+                'path': comp.get_path_name(),
+                'classPath': comp.get_class().get_path_name(),
+                'parent': parent.get_name() if parent is not None else '',
+                'parentPath': obj_path(parent),
+                'children': children,
+                'relativeTransform': rel_transform(comp),
+                'resources': resource_refs(comp)
+            })
+        _emit({'ok': True, 'blueprintPath': bp.get_path_name(),
+               'generatedClassPath': gen.get_path_name(),
+               'componentCount': len(items),
+               'components': items})
+)PY";
+            if (arg_str(args, "blueprintPath").empty())
+                return ToolResult::error("blueprintPath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_set_blueprint_component_template_transform -----------------------
+    add(Tool{
+        "ue_set_blueprint_component_template_transform",
+        "Persistently set a Blueprint component template's relative location, "
+        "rotation, and/or scale on the Blueprint generated CDO and, when Python "
+        "exposes it, the SCS component template. This is for fixing defaults "
+        "such as BP_HeroineThirdPersonPawn.HeroineMesh rather than only the "
+        "current level instance. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"componentName", {{"type", "string"}}},
+               {"location", {{"type", "object"}}},
+               {"rotation", {{"type", "object"}}},
+               {"scale", {{"type", "object"}}},
+               {"compile", {{"type", "boolean"}}},
+               {"save", {{"type", "boolean"}}}}},
+             {"required", json::array({"blueprintPath", "componentName"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp_path = _ARGS['blueprintPath']
+wanted = _ARGS['componentName']
+compile_bp = bool(_ARGS.get('compile', True))
+save_bp = bool(_ARGS.get('save', True))
+bp = unreal.EditorAssetLibrary.load_asset(bp_path)
+warnings = []
+updated = []
+
+def generated_class(asset):
+    try:
+        return asset.get_editor_property('generated_class')
+    except Exception:
+        return getattr(asset, 'generated_class', None)
+
+def vec_arg(key, default=None):
+    if key not in _ARGS:
+        return default
+    src = _ARGS.get(key) or {}
+    return unreal.Vector(float(src.get('x', 0.0)),
+                         float(src.get('y', 0.0)),
+                         float(src.get('z', 0.0)))
+
+def rot_arg(key, default=None):
+    if key not in _ARGS:
+        return default
+    src = _ARGS.get(key) or {}
+    return unreal.Rotator(float(src.get('pitch', 0.0)),
+                          float(src.get('yaw', 0.0)),
+                          float(src.get('roll', 0.0)))
+
+def vdict(v):
+    return {'x': float(v.x), 'y': float(v.y), 'z': float(v.z)}
+
+def rdict(r):
+    return {'pitch': float(r.pitch), 'yaw': float(r.yaw), 'roll': float(r.roll)}
+
+def call_any(obj, names, *args):
+    for name in names:
+        fn = getattr(obj, name, None)
+        if fn is not None:
+            try:
+                return fn(*args)
+            except Exception:
+                pass
+    return None
+
+def prop_any(obj, names, default=None):
+    for name in names:
+        try:
+            return obj.get_editor_property(name)
+        except Exception:
+            pass
+    return default
+
+def matches(comp, extra_name=''):
+    names = [extra_name, comp.get_name()]
+    try:
+        names.append(str(comp.get_fname()))
+    except Exception:
+        pass
+    try:
+        names.append(comp.get_path_name())
+    except Exception:
+        pass
+    return any(n and (n == wanted or wanted in n) for n in names)
+
+def apply_transform(comp, source):
+    if comp is None:
+        return False
+    try:
+        comp.modify()
+    except Exception:
+        pass
+    loc = vec_arg('location')
+    rot = rot_arg('rotation')
+    scale = vec_arg('scale')
+    if loc is not None:
+        try:
+            comp.set_editor_property('relative_location', loc)
+        except Exception:
+            call_any(comp, ['set_relative_location'], loc)
+    if rot is not None:
+        try:
+            comp.set_editor_property('relative_rotation', rot)
+        except Exception:
+            call_any(comp, ['set_relative_rotation'], rot)
+    if scale is not None:
+        try:
+            comp.set_editor_property('relative_scale3d', scale)
+        except Exception:
+            call_any(comp, ['set_relative_scale3d'], scale)
+    try:
+        comp.post_edit_change()
+    except Exception:
+        pass
+    rloc = call_any(comp, ['get_relative_location']) or prop_any(comp, ['relative_location'])
+    rrot = call_any(comp, ['get_relative_rotation']) or prop_any(comp, ['relative_rotation'])
+    rscale = call_any(comp, ['get_relative_scale3d']) or prop_any(comp, ['relative_scale3d'])
+    updated.append({'source': source, 'name': comp.get_name(),
+                    'path': comp.get_path_name(),
+                    'classPath': comp.get_class().get_path_name(),
+                    'relativeTransform': {
+                        'location': vdict(rloc) if rloc is not None else None,
+                        'rotation': rdict(rrot) if rrot is not None else None,
+                        'scale': vdict(rscale) if rscale is not None else None}})
+    return True
+
+def scs_nodes(asset):
+    scs = prop_any(asset, ['simple_construction_script'])
+    if scs is None:
+        scs = getattr(asset, 'simple_construction_script', None)
+    if scs is None:
+        return []
+    for name in ('get_all_nodes', 'get_root_nodes'):
+        fn = getattr(scs, name, None)
+        if fn is not None:
+            try:
+                return list(fn())
+            except Exception as e:
+                warnings.append('SCS %s failed: %s' % (name, e))
+    return []
+
+if bp is None:
+    _emit({'ok': False, 'error': 'could not load blueprint: %s' % bp_path})
+else:
+    # SCS templates first: authored Blueprint components live here when exposed.
+    for node in scs_nodes(bp):
+        node_name = ''
+        try:
+            node_name = str(node.get_variable_name())
+        except Exception:
+            pass
+        tmpl = None
+        for name in ('get_component_template',):
+            fn = getattr(node, name, None)
+            if fn is not None:
+                try:
+                    tmpl = fn()
+                    break
+                except Exception:
+                    pass
+        if tmpl is None:
+            tmpl = prop_any(node, ['component_template'])
+        if tmpl is not None and matches(tmpl, node_name):
+            apply_transform(tmpl, 'SCS')
+
+    gen = generated_class(bp)
+    if gen is None:
+        warnings.append('blueprint has no generated_class')
+    else:
+        cdo = unreal.get_default_object(gen)
+        try:
+            comps = list(cdo.get_components_by_class(unreal.ActorComponent))
+        except Exception:
+            comps = []
+        for comp in comps:
+            if matches(comp):
+                apply_transform(comp, 'generatedCDO')
+
+    if not updated:
+        _emit({'ok': False, 'error': 'component not found on blueprint: %s' % wanted,
+               'warnings': warnings})
+    else:
+        try:
+            bp.modify()
+        except Exception:
+            pass
+        if compile_bp and hasattr(unreal, 'BlueprintEditorLibrary'):
+            try:
+                unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+            except Exception as e:
+                warnings.append('compile_blueprint failed: %s' % e)
+        if save_bp:
+            try:
+                unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+            except Exception as e:
+                warnings.append('save_asset failed: %s' % e)
+        _emit({'ok': True, 'blueprintPath': bp.get_path_name(),
+               'componentName': wanted, 'updated': updated, 'warnings': warnings})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() ||
+                arg_str(args, "componentName").empty())
+                return ToolResult::error("blueprintPath and componentName are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_normalize_imported_character_mesh --------------------------------
+    add(Tool{
+        "ue_normalize_imported_character_mesh",
+        "Compute a rotation and optional uniform scale recommendation for a "
+        "character mesh imported with a different up/forward convention "
+        "(Y-up/Z-up, X-forward/Y-forward, etc.). Defaults targetUp=Z and "
+        "targetForward=X for Unreal. Pass applyToComponentPath plus apply=true "
+        "to write the suggested relative rotation/scale to a component; otherwise "
+        "the tool only returns the recommendation. Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"assetPath", {{"type", "string"}}},
+               {"sourceUp", {{"type", "string"}}},
+               {"sourceForward", {{"type", "string"}}},
+               {"targetUp", {{"type", "string"}}},
+               {"targetForward", {{"type", "string"}}},
+               {"targetHeight", {{"type", "number"}}},
+               {"applyToComponentPath", {{"type", "string"}}},
+               {"apply", {{"type", "boolean"}}}}},
+             {"required", json::array({})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+source_up = (_ARGS.get('sourceUp') or 'Y').upper()
+source_forward = (_ARGS.get('sourceForward') or 'Z').upper()
+target_up = (_ARGS.get('targetUp') or 'Z').upper()
+target_forward = (_ARGS.get('targetForward') or 'X').upper()
+asset_path = _ARGS.get('assetPath') or ''
+target_height = _ARGS.get('targetHeight')
+apply_path = _ARGS.get('applyToComponentPath') or ''
+apply = bool(_ARGS.get('apply', False))
+warnings = []
+
+def axis(name):
+    sign = -1.0 if name.startswith('-') else 1.0
+    base = name[1:] if name.startswith('-') else name
+    if base == 'X':
+        return (sign, 0.0, 0.0)
+    if base == 'Y':
+        return (0.0, sign, 0.0)
+    if base == 'Z':
+        return (0.0, 0.0, sign)
+    raise RuntimeError('axis must be X, Y, Z, -X, -Y, or -Z: %s' % name)
+
+def dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+def cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+def norm(a):
+    l = (dot(a, a)) ** 0.5
+    if l <= 0.000001:
+        raise RuntimeError('zero-length axis')
+    return (a[0] / l, a[1] / l, a[2] / l)
+
+def basis(up_name, forward_name):
+    f = norm(axis(forward_name))
+    u = norm(axis(up_name))
+    if abs(dot(f, u)) > 0.999:
+        raise RuntimeError('up and forward axes must not be parallel')
+    r = norm(cross(u, f))
+    u = norm(cross(f, r))
+    return (f, r, u)
+
+def mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+def mat_transpose(a):
+    return [[a[j][i] for j in range(3)] for i in range(3)]
+
+def basis_matrix(b):
+    # Columns are forward(X), right(Y), up(Z) basis vectors in world axes.
+    return [[b[0][0], b[1][0], b[2][0]],
+            [b[0][1], b[1][1], b[2][1]],
+            [b[0][2], b[1][2], b[2][2]]]
+
+def quat_from_matrix(m):
+    tr = m[0][0] + m[1][1] + m[2][2]
+    if tr > 0.0:
+        s = (tr + 1.0) ** 0.5 * 2.0
+        w = 0.25 * s
+        x = (m[2][1] - m[1][2]) / s
+        y = (m[0][2] - m[2][0]) / s
+        z = (m[1][0] - m[0][1]) / s
+    elif m[0][0] > m[1][1] and m[0][0] > m[2][2]:
+        s = (1.0 + m[0][0] - m[1][1] - m[2][2]) ** 0.5 * 2.0
+        w = (m[2][1] - m[1][2]) / s
+        x = 0.25 * s
+        y = (m[0][1] + m[1][0]) / s
+        z = (m[0][2] + m[2][0]) / s
+    elif m[1][1] > m[2][2]:
+        s = (1.0 + m[1][1] - m[0][0] - m[2][2]) ** 0.5 * 2.0
+        w = (m[0][2] - m[2][0]) / s
+        x = (m[0][1] + m[1][0]) / s
+        y = 0.25 * s
+        z = (m[1][2] + m[2][1]) / s
+    else:
+        s = (1.0 + m[2][2] - m[0][0] - m[1][1]) ** 0.5 * 2.0
+        w = (m[1][0] - m[0][1]) / s
+        x = (m[0][2] + m[2][0]) / s
+        y = (m[1][2] + m[2][1]) / s
+        z = 0.25 * s
+    return (x, y, z, w)
+
+def resolve(path):
+    for fn_name in ('load_object', 'find_object'):
+        fn = getattr(unreal, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            obj = fn(None, path)
+            if obj is not None:
+                return obj
+        except Exception:
+            pass
+    return None
+
+def asset_height(asset, up_name):
+    if asset is None:
+        return None
+    b = None
+    for name in ('get_bounds', 'get_imported_bounds'):
+        fn = getattr(asset, name, None)
+        if fn is not None:
+            try:
+                b = fn()
+                break
+            except Exception:
+                pass
+    if b is None:
+        return None
+    vec = axis(up_name)
+    extent = abs(vec[0]) * b.box_extent.x + abs(vec[1]) * b.box_extent.y + abs(vec[2]) * b.box_extent.z
+    return extent * 2.0
+
+src_b = basis(source_up, source_forward)
+tgt_b = basis(target_up, target_forward)
+matrix = mat_mul(basis_matrix(tgt_b), mat_transpose(basis_matrix(src_b)))
+qx, qy, qz, qw = quat_from_matrix(matrix)
+rotation = None
+try:
+    rot = unreal.Quat(qx, qy, qz, qw).rotator()
+    rotation = {'pitch': float(rot.pitch), 'yaw': float(rot.yaw), 'roll': float(rot.roll)}
+except Exception as e:
+    warnings.append('could not convert quaternion to Rotator: %s' % e)
+
+uniform_scale = None
+height = None
+asset = unreal.EditorAssetLibrary.load_asset(asset_path) if asset_path else None
+if target_height is not None and asset is not None:
+    height = asset_height(asset, source_up)
+    if height and height > 0.000001:
+        uniform_scale = float(target_height) / height
+    else:
+        warnings.append('could not compute asset height from bounds')
+
+applied = False
+if apply and apply_path:
+    comp = resolve(apply_path)
+    if comp is None:
+        warnings.append('could not resolve applyToComponentPath')
+    else:
+        if rotation is not None:
+            try:
+                comp.set_relative_rotation(unreal.Rotator(rotation['pitch'], rotation['yaw'], rotation['roll']))
+            except Exception:
+                comp.set_editor_property('relative_rotation', unreal.Rotator(rotation['pitch'], rotation['yaw'], rotation['roll']))
+        if uniform_scale is not None:
+            s = unreal.Vector(uniform_scale, uniform_scale, uniform_scale)
+            try:
+                comp.set_relative_scale3d(s)
+            except Exception:
+                comp.set_editor_property('relative_scale3d', s)
+        applied = True
+
+_emit({'ok': True,
+       'source': {'up': source_up, 'forward': source_forward},
+       'target': {'up': target_up, 'forward': target_forward},
+       'suggestedRelativeRotation': rotation,
+       'suggestedQuaternion': {'x': qx, 'y': qy, 'z': qz, 'w': qw},
+       'suggestedRotationMatrix': matrix,
+       'assetPath': asset_path,
+       'assetHeight': height,
+       'targetHeight': target_height,
+       'suggestedUniformScale': uniform_scale,
+       'applied': applied,
+       'warnings': warnings})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_simulate_player_input --------------------------------------------
+    add(Tool{
+        "ue_simulate_player_input",
+        "Inject key and axis input into the PIE PlayerController, then report "
+        "the possessed pawn movement delta. Supports keys like W/A/S/D/SpaceBar "
+        "and raw axis samples. If PlayerController input injection is not exposed "
+        "on the engine's Python API, the tool falls back to AddMovementInput and "
+        "reports that fallback explicitly. Python recipe; requires "
+        "PythonScriptPlugin and PIE control.",
+        json{{"type", "object"},
+             {"properties",
+              {{"playerIndex", {{"type", "integer"}}},
+               {"startPie", {{"type", "boolean"}}},
+               {"stopPie", {{"type", "boolean"}}},
+               {"durationSeconds", {{"type", "number"}}},
+               {"steps", {{"type", "integer"}}},
+               {"keys", {{"type", "array"}}},
+               {"axes", {{"type", "array"}}},
+               {"fallbackMovementInput", {{"type", "boolean"}}}}},
+             {"required", json::array({})}},
+        {Capability::PythonScripting, Capability::PieControl},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+import time
+warnings = []
+strategies = []
+player_index = int(_ARGS.get('playerIndex', 0))
+duration = float(_ARGS.get('durationSeconds', 0.25))
+steps = max(1, int(_ARGS.get('steps', 6)))
+keys = list(_ARGS.get('keys') or [{'key': 'W', 'event': 'Pressed'}])
+axes = list(_ARGS.get('axes') or [])
+fallback_movement = bool(_ARGS.get('fallbackMovementInput', True))
+
+def call_any(obj, names):
+    for name in names:
+        fn = getattr(obj, name, None)
+        if fn is not None:
+            return fn()
+    raise RuntimeError('none of methods found: %s' % names)
+
+def vdict(v):
+    return {'x': float(v.x), 'y': float(v.y), 'z': float(v.z)}
+
+def dist(a, b):
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2) ** 0.5
+
+def enum_value(enum_names, event_name):
+    normalized = str(event_name or 'Pressed').upper()
+    candidates = {
+        'PRESSED': ('IE_PRESSED', 'PRESSED'),
+        'RELEASED': ('IE_RELEASED', 'RELEASED'),
+        'REPEAT': ('IE_REPEAT', 'REPEAT'),
+        'DOUBLECLICK': ('IE_DOUBLE_CLICK', 'DOUBLE_CLICK'),
+        'AXIS': ('IE_AXIS', 'AXIS')
+    }.get(normalized, ('IE_PRESSED', 'PRESSED'))
+    for enum_name in enum_names:
+        enum = getattr(unreal, enum_name, None)
+        if enum is None:
+            continue
+        for c in candidates:
+            if hasattr(enum, c):
+                return getattr(enum, c)
+    return None
+
+def key_value(name):
+    for ctor in (getattr(unreal, 'Key', None),):
+        if ctor is not None:
+            try:
+                return ctor(str(name))
+            except Exception:
+                pass
+    return str(name)
+
+level = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem) if hasattr(unreal, 'LevelEditorSubsystem') else None
+if bool(_ARGS.get('startPie', False)):
+    if level is None:
+        warnings.append('LevelEditorSubsystem unavailable; could not start PIE')
+    else:
+        try:
+            call_any(level, ['editor_request_begin_play', 'EditorRequestBeginPlay'])
+            strategies.append('LevelEditorSubsystem.beginPlay')
+            time.sleep(0.25)
+        except Exception as e:
+            warnings.append('start PIE failed: %s' % e)
+
+world = None
+try:
+    editor_subsystem = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+    world = editor_subsystem.get_game_world()
+except Exception as e:
+    warnings.append('get_game_world failed: %s' % e)
+if world is None:
+    try:
+        editor_subsystem = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+        world = editor_subsystem.get_editor_world()
+    except Exception as e:
+        warnings.append('get_editor_world failed: %s' % e)
+if world is None:
+    raise RuntimeError('could not resolve PIE or editor world')
+
+pc = unreal.GameplayStatics.get_player_controller(world, player_index)
+if pc is None:
+    raise RuntimeError('PlayerController %d not found' % player_index)
+pawn = pc.get_pawn()
+if pawn is None:
+    raise RuntimeError('PlayerController %d has no pawn' % player_index)
+
+before = pawn.get_actor_location()
+pc_input_calls = 0
+event_enum = ('InputEvent', 'EInputEvent')
+
+for item in keys:
+    key = key_value(item.get('key', 'W'))
+    ev = enum_value(event_enum, item.get('event', 'Pressed'))
+    amount = float(item.get('amount', 1.0))
+    gamepad = bool(item.get('gamepad', False))
+    if ev is None:
+        warnings.append('InputEvent enum unavailable for key %s' % item.get('key'))
+        continue
+    fn = getattr(pc, 'input_key', None)
+    if fn is not None:
+        for attempt in ((key, ev, amount, gamepad), (key, ev, amount), (key, ev)):
+            try:
+                fn(*attempt)
+                pc_input_calls += 1
+                strategies.append('PlayerController.input_key')
+                break
+            except Exception:
+                pass
+
+dt = duration / float(steps)
+for _i in range(steps):
+    for item in axes:
+        key = key_value(item.get('key', item.get('axis', 'W')))
+        value = float(item.get('value', 1.0))
+        gamepad = bool(item.get('gamepad', False))
+        fn = getattr(pc, 'input_axis', None)
+        if fn is not None:
+            for attempt in ((key, value, dt, 1, gamepad), (key, value, dt, 1), (key, value, dt)):
+                try:
+                    fn(*attempt)
+                    pc_input_calls += 1
+                    strategies.append('PlayerController.input_axis')
+                    break
+                except Exception:
+                    pass
+    time.sleep(dt)
+
+fallback_used = False
+if pc_input_calls == 0 and fallback_movement:
+    forward = 0.0
+    right = 0.0
+    for item in keys:
+        k = str(item.get('key', '')).upper()
+        if k in ('W', 'UP'):
+            forward += 1.0
+        elif k in ('S', 'DOWN'):
+            forward -= 1.0
+        elif k in ('D', 'RIGHT'):
+            right += 1.0
+        elif k in ('A', 'LEFT'):
+            right -= 1.0
+    for item in axes:
+        axis = str(item.get('axis', item.get('key', ''))).lower()
+        value = float(item.get('value', 0.0))
+        if 'forward' in axis or axis.endswith('y'):
+            forward += value
+        elif 'right' in axis or axis.endswith('x'):
+            right += value
+    for _i in range(steps):
+        if abs(forward) > 0.0001:
+            pawn.add_movement_input(pawn.get_actor_forward_vector(), forward, False)
+        if abs(right) > 0.0001:
+            pawn.add_movement_input(pawn.get_actor_right_vector(), right, False)
+        move = pawn.get_component_by_class(unreal.CharacterMovementComponent)
+        if move is not None:
+            try:
+                move.tick_component(dt, unreal.LevelTick.LEVELTICK_All, None)
+            except Exception:
+                pass
+        time.sleep(dt)
+    fallback_used = True
+    strategies.append('Pawn.add_movement_input fallback')
+
+after = pawn.get_actor_location()
+
+if bool(_ARGS.get('stopPie', False)):
+    if level is None:
+        warnings.append('LevelEditorSubsystem unavailable; could not stop PIE')
+    else:
+        try:
+            call_any(level, ['editor_request_end_play', 'EditorRequestEndPlay'])
+            strategies.append('LevelEditorSubsystem.endPlay')
+        except Exception as e:
+            warnings.append('stop PIE failed: %s' % e)
+
+_emit({'ok': True,
+       'playerIndex': player_index,
+       'controllerPath': pc.get_path_name(),
+       'pawnPath': pawn.get_path_name(),
+       'locationBefore': vdict(before),
+       'locationAfter': vdict(after),
+       'movedDistance': dist(before, after),
+       'playerControllerInputCalls': pc_input_calls,
+       'fallbackMovementInputUsed': fallback_used,
+       'strategies': list(dict.fromkeys(strategies)),
+       'warnings': warnings})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
+// ---------------------------------------------------------------------------
 // Material + visual tools. ue_set_material_param edits a component's material
 // at runtime by creating a Dynamic Material Instance on the chosen element and
 // setting a scalar/vector/texture parameter on it — the direct fix for tasks
@@ -2309,6 +3638,160 @@ _emit({'ok': len(imported) > 0, 'error': '' if imported else 'no objects importe
             return run_python_recipe(ctx, kRecipe, args);
         }});
 
+    // -- ue_import_asset_with_transform_policy -------------------------------
+    add(Tool{
+        "ue_import_asset_with_transform_policy",
+        "Import FBX/GLB/glTF or other assets while explicitly setting import "
+        "transform policy options such as convertScene, forceFrontXAxis, "
+        "convertSceneUnit, importUniformScale, importAsSkeletal, and nested "
+        "skeletalMeshImportData/staticMeshImportData overrides where the engine "
+        "Python API exposes them. Python recipe using AssetImportTask; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"sourceFile", {{"type", "string"}}},
+               {"destinationPath", {{"type", "string"}}},
+               {"replaceExisting", {{"type", "boolean"}}},
+               {"save", {{"type", "boolean"}}},
+               {"importAsSkeletal", {{"type", "boolean"}}},
+               {"importMaterials", {{"type", "boolean"}}},
+               {"importTextures", {{"type", "boolean"}}},
+               {"convertScene", {{"type", "boolean"}}},
+               {"forceFrontXAxis", {{"type", "boolean"}}},
+               {"convertSceneUnit", {{"type", "boolean"}}},
+               {"importUniformScale", {{"type", "number"}}},
+               {"skeletalMeshImportData", {{"type", "object"}}},
+                {"staticMeshImportData", {{"type", "object"}}}}},
+             {"required", json::array({"sourceFile", "destinationPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+src = _ARGS['sourceFile']
+dst = _ARGS['destinationPath']
+replace = bool(_ARGS.get('replaceExisting', True))
+save = bool(_ARGS.get('save', True))
+warnings = []
+applied = {}
+failed = {}
+
+def jsonable(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    try:
+        return value.get_path_name()
+    except Exception:
+        return str(value)
+
+def set_prop(obj, prop, value, label=None):
+    label = label or prop
+    if obj is None:
+        failed[label] = 'target object unavailable'
+        return False
+    try:
+        obj.set_editor_property(prop, value)
+        applied[label] = jsonable(value)
+        return True
+    except Exception as e:
+        failed[label] = str(e)
+        return False
+
+def get_prop(obj, prop):
+    try:
+        return obj.get_editor_property(prop)
+    except Exception:
+        return None
+
+def apply_import_data(data, prefix, extra):
+    if data is None:
+        failed[prefix] = 'import data object unavailable'
+        return
+    mapping = (
+        ('convertScene', 'convert_scene'),
+        ('forceFrontXAxis', 'force_front_x_axis'),
+        ('convertSceneUnit', 'convert_scene_unit'),
+        ('importUniformScale', 'import_uniform_scale')
+    )
+    for arg_key, prop in mapping:
+        if arg_key in _ARGS:
+            set_prop(data, prop, _ARGS[arg_key], '%s.%s' % (prefix, prop))
+    for key, value in (extra or {}).items():
+        prop = ''.join(['_' + c.lower() if c.isupper() else c for c in str(key)]).lstrip('_')
+        if not set_prop(data, prop, value, '%s.%s' % (prefix, prop)):
+            set_prop(data, str(key), value, '%s.%s' % (prefix, key))
+
+task = unreal.AssetImportTask()
+set_prop(task, 'filename', src)
+set_prop(task, 'destination_path', dst)
+set_prop(task, 'automated', True)
+set_prop(task, 'save', save)
+set_prop(task, 'replace_existing', replace)
+
+lower = src.lower()
+options = None
+if lower.endswith('.fbx') and hasattr(unreal, 'FbxImportUI'):
+    options = unreal.FbxImportUI()
+    set_prop(options, 'automated_import_should_detect_type', not bool(_ARGS.get('importAsSkeletal', False)),
+             'fbx.automated_import_should_detect_type')
+    if 'importAsSkeletal' in _ARGS:
+        skeletal = bool(_ARGS.get('importAsSkeletal'))
+        set_prop(options, 'import_as_skeletal', skeletal, 'fbx.import_as_skeletal')
+        enum = getattr(unreal, 'FBXImportType', None)
+        if enum is not None:
+            if skeletal and hasattr(enum, 'FBXIT_SKELETAL_MESH'):
+                set_prop(options, 'mesh_type_to_import', enum.FBXIT_SKELETAL_MESH, 'fbx.mesh_type_to_import')
+            elif (not skeletal) and hasattr(enum, 'FBXIT_STATIC_MESH'):
+                set_prop(options, 'mesh_type_to_import', enum.FBXIT_STATIC_MESH, 'fbx.mesh_type_to_import')
+    if 'importMaterials' in _ARGS:
+        set_prop(options, 'import_materials', bool(_ARGS.get('importMaterials')), 'fbx.import_materials')
+    if 'importTextures' in _ARGS:
+        set_prop(options, 'import_textures', bool(_ARGS.get('importTextures')), 'fbx.import_textures')
+    apply_import_data(get_prop(options, 'static_mesh_import_data'), 'staticMeshImportData',
+                      _ARGS.get('staticMeshImportData') or {})
+    apply_import_data(get_prop(options, 'skeletal_mesh_import_data'), 'skeletalMeshImportData',
+                      _ARGS.get('skeletalMeshImportData') or {})
+elif lower.endswith('.glb') or lower.endswith('.gltf'):
+    # GLTF importer option class names have changed across engine/plugin
+    # versions. Try the known names and set matching properties when present.
+    opt_cls = None
+    for cls_name in ('GLTFImportOptions', 'GltfImportOptions', 'GLTFImportSettings'):
+        opt_cls = getattr(unreal, cls_name, None)
+        if opt_cls is not None:
+            break
+    if opt_cls is not None:
+        try:
+            options = opt_cls()
+            for arg_key, prop in (('importUniformScale', 'import_uniform_scale'),
+                                  ('convertScene', 'convert_scene'),
+                                  ('forceFrontXAxis', 'force_front_x_axis'),
+                                  ('convertSceneUnit', 'convert_scene_unit')):
+                if arg_key in _ARGS:
+                    set_prop(options, prop, _ARGS[arg_key], 'gltf.%s' % prop)
+        except Exception as e:
+            warnings.append('could not create GLTF import options: %s' % e)
+    else:
+        warnings.append('GLTF import options class not exposed; task will use plugin defaults')
+else:
+    warnings.append('no specialized transform import UI for this extension; task will use factory defaults')
+
+if options is not None:
+    set_prop(task, 'options', options, 'task.options')
+
+unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+imported = list(task.get_editor_property('imported_object_paths') or [])
+_emit({'ok': len(imported) > 0,
+       'error': '' if imported else 'no objects imported (check source path/format/import plugin)',
+       'sourceFile': src,
+       'destinationPath': dst,
+       'imported': imported,
+       'appliedOptions': applied,
+       'failedOptions': failed,
+       'warnings': warnings})
+)PY";
+            if (arg_str(args, "sourceFile").empty() || arg_str(args, "destinationPath").empty())
+                return ToolResult::error("sourceFile and destinationPath are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
     // -- ue_create_folder -----------------------------------------------------
     add(Tool{
         "ue_create_folder",
@@ -2551,6 +4034,1524 @@ else:
             return run_python_recipe(ctx, kRecipe, args);
         }});
 
+    // -- ue_create_character_blueprint ---------------------------------------
+    add(Tool{
+        "ue_create_character_blueprint",
+        "Create a gameplay-ready Character Blueprint and configure its inherited "
+        "CapsuleComponent, Mesh, and CharacterMovementComponent. Optional "
+        "skeletalMeshPath and animBlueprintPath assign the visible character and "
+        "animation class. The recipe also tries to add a SpringArm + Camera using "
+        "SubobjectDataSubsystem when available, returning cameraAdded=false with "
+        "strategiesTried if this engine's Python API cannot author components. "
+        "Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"name", {{"type", "string"}}},
+               {"packagePath", {{"type", "string"}}},
+               {"skeletalMeshPath", {{"type", "string"}}},
+               {"animBlueprintPath", {{"type", "string"}}},
+               {"meshOffset", {{"type", "object"}}},
+               {"meshRotation", {{"type", "object"}}},
+               {"meshScale", {{"type", "object"}}},
+               {"capsuleRadius", {{"type", "number"}}},
+               {"capsuleHalfHeight", {{"type", "number"}}},
+               {"maxWalkSpeed", {{"type", "number"}}},
+               {"jumpZVelocity", {{"type", "number"}}},
+               {"airControl", {{"type", "number"}}},
+               {"rotationRateYaw", {{"type", "number"}}},
+               {"orientRotationToMovement", {{"type", "boolean"}}},
+               {"useControllerYawRotation", {{"type", "boolean"}}},
+               {"addCamera", {{"type", "boolean"}}},
+               {"cameraBoomLength", {{"type", "number"}}},
+               {"cameraSocketOffset", {{"type", "object"}}},
+               {"reuseExisting", {{"type", "boolean"}}}}},
+             {"required", json::array({"name", "packagePath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+name = _ARGS['name']
+pkg = _ARGS['packagePath'].rstrip('/')
+asset_path = pkg + '/' + name
+configured = []
+warnings = []
+strategies = []
+
+def num(key, default):
+    try:
+        return float(_ARGS.get(key, default))
+    except Exception:
+        return float(default)
+
+def bool_arg(key, default):
+    v = _ARGS.get(key, default)
+    return bool(v)
+
+def vec_arg(key, default):
+    src = _ARGS.get(key) or {}
+    return unreal.Vector(float(src.get('x', default[0])),
+                         float(src.get('y', default[1])),
+                         float(src.get('z', default[2])))
+
+def rot_arg(key, default):
+    src = _ARGS.get(key) or {}
+    return unreal.Rotator(float(src.get('pitch', default[0])),
+                          float(src.get('yaw', default[1])),
+                          float(src.get('roll', default[2])))
+
+def warn(msg):
+    warnings.append(str(msg))
+
+def safe_set(obj, prop, value, label):
+    try:
+        obj.set_editor_property(prop, value)
+        configured.append(label)
+        return True
+    except Exception as e:
+        warn('%s failed: %s' % (label, e))
+        return False
+
+def load_asset_or_fail(path, label):
+    if not path:
+        return None
+    obj = unreal.EditorAssetLibrary.load_asset(path)
+    if obj is None:
+        raise RuntimeError('could not load %s: %s' % (label, path))
+    return obj
+
+def get_bp_generated_class(bp):
+    try:
+        cls = bp.get_editor_property('generated_class')
+        if cls is not None:
+            return cls
+    except Exception:
+        pass
+    try:
+        return bp.generated_class
+    except Exception:
+        return None
+
+def compile_bp(bp):
+    if hasattr(unreal, 'BlueprintEditorLibrary'):
+        unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+
+def first_component(cdo, prop_names, cls):
+    for prop in prop_names:
+        try:
+            obj = cdo.get_editor_property(prop)
+            if obj is not None:
+                return obj
+        except Exception:
+            pass
+    try:
+        comps = cdo.get_components_by_class(cls)
+        if comps:
+            return comps[0]
+    except Exception:
+        pass
+    try:
+        return cdo.get_component_by_class(cls)
+    except Exception:
+        return None
+
+if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+    if not bool_arg('reuseExisting', False):
+        raise RuntimeError('asset already exists; pass reuseExisting=true to configure it: %s' % asset_path)
+    bp = unreal.EditorAssetLibrary.load_asset(asset_path)
+    if bp is None:
+        raise RuntimeError('asset exists but could not be loaded: %s' % asset_path)
+else:
+    factory = unreal.BlueprintFactory()
+    factory.set_editor_property('parent_class', unreal.Character)
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+    bp = tools.create_asset(name, pkg, unreal.Blueprint, factory)
+    if bp is None:
+        raise RuntimeError('create_asset returned None: %s' % asset_path)
+
+compile_bp(bp)
+generated = get_bp_generated_class(bp)
+if generated is None:
+    raise RuntimeError('blueprint has no generated class after compile: %s' % bp.get_path_name())
+
+cdo = unreal.get_default_object(generated)
+if cdo is None:
+    raise RuntimeError('could not get blueprint class default object: %s' % bp.get_path_name())
+
+safe_set(cdo, 'use_controller_rotation_yaw', bool_arg('useControllerYawRotation', False), 'character.useControllerYawRotation')
+safe_set(cdo, 'use_controller_rotation_pitch', False, 'character.useControllerRotationPitch')
+safe_set(cdo, 'use_controller_rotation_roll', False, 'character.useControllerRotationRoll')
+
+capsule = first_component(cdo, ['capsule_component'], unreal.CapsuleComponent)
+if capsule is None:
+    warn('CapsuleComponent not found')
+else:
+    radius = num('capsuleRadius', 34.0)
+    half_height = num('capsuleHalfHeight', 88.0)
+    try:
+        capsule.set_capsule_size(radius, half_height, True)
+        configured.append('capsule.size')
+    except Exception as e:
+        warn('capsule.set_capsule_size failed: %s' % e)
+        safe_set(capsule, 'capsule_radius', radius, 'capsule.radius')
+        safe_set(capsule, 'capsule_half_height', half_height, 'capsule.halfHeight')
+
+mesh = first_component(cdo, ['mesh'], unreal.SkeletalMeshComponent)
+if mesh is None:
+    warn('SkeletalMeshComponent not found')
+else:
+    skel_path = _ARGS.get('skeletalMeshPath') or ''
+    if skel_path:
+        skel = load_asset_or_fail(skel_path, 'skeletal mesh')
+        try:
+            mesh.set_skeletal_mesh(skel)
+            configured.append('mesh.skeletalMesh')
+        except Exception as e:
+            warn('mesh.set_skeletal_mesh failed: %s' % e)
+            safe_set(mesh, 'skeletal_mesh', skel, 'mesh.skeletalMesh')
+
+    safe_set(mesh, 'relative_location', vec_arg('meshOffset', (0.0, 0.0, -88.0)), 'mesh.relativeLocation')
+    safe_set(mesh, 'relative_rotation', rot_arg('meshRotation', (0.0, -90.0, 0.0)), 'mesh.relativeRotation')
+    safe_set(mesh, 'relative_scale3d', vec_arg('meshScale', (1.0, 1.0, 1.0)), 'mesh.relativeScale')
+
+    anim_path = _ARGS.get('animBlueprintPath') or ''
+    if anim_path:
+        anim = load_asset_or_fail(anim_path, 'animation blueprint')
+        anim_class = None
+        for prop in ('generated_class', 'skeleton_generated_class'):
+            try:
+                anim_class = anim.get_editor_property(prop)
+                if anim_class is not None:
+                    break
+            except Exception:
+                pass
+        if anim_class is None and anim_path.endswith('_C'):
+            try:
+                anim_class = unreal.load_object(None, anim_path)
+            except Exception:
+                anim_class = None
+        if anim_class is None:
+            warn('animation blueprint loaded but generated class was unavailable: %s' % anim_path)
+        else:
+            try:
+                mesh.set_animation_mode(unreal.AnimationMode.ANIMATION_BLUEPRINT)
+                configured.append('mesh.animationMode')
+            except Exception as e:
+                warn('mesh.set_animation_mode failed: %s' % e)
+            try:
+                mesh.set_anim_instance_class(anim_class)
+                configured.append('mesh.animClass')
+            except Exception as e:
+                warn('mesh.set_anim_instance_class failed: %s' % e)
+                safe_set(mesh, 'anim_class', anim_class, 'mesh.animClass')
+
+movement = first_component(cdo, ['character_movement'], unreal.CharacterMovementComponent)
+if movement is None:
+    warn('CharacterMovementComponent not found')
+else:
+    safe_set(movement, 'max_walk_speed', num('maxWalkSpeed', 500.0), 'movement.maxWalkSpeed')
+    safe_set(movement, 'jump_z_velocity', num('jumpZVelocity', 700.0), 'movement.jumpZVelocity')
+    safe_set(movement, 'air_control', num('airControl', 0.35), 'movement.airControl')
+    safe_set(movement, 'orient_rotation_to_movement', bool_arg('orientRotationToMovement', True), 'movement.orientRotationToMovement')
+    safe_set(movement, 'rotation_rate', unreal.Rotator(0.0, num('rotationRateYaw', 540.0), 0.0), 'movement.rotationRate')
+
+camera_added = False
+camera_components = []
+
+def obj_from_handle(bp, handle):
+    bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+    data = bfl.get_data(handle)
+    try:
+        return bfl.get_object_for_blueprint(data, bp)
+    except Exception:
+        return bfl.get_object(data)
+
+def is_valid_handle(handle):
+    try:
+        return unreal.SubobjectDataBlueprintFunctionLibrary.is_handle_valid(handle)
+    except Exception:
+        return handle is not None
+
+def find_parent_handle(bp, subsystem, handles):
+    bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+    fallback = handles[0] if handles else None
+    for handle in handles:
+        try:
+            data = bfl.get_data(handle)
+            name_text = str(bfl.get_variable_name(data))
+            if name_text == 'CapsuleComponent' or bfl.is_root_component(data):
+                return handle
+        except Exception:
+            pass
+    return fallback
+
+def add_component(bp, parent_handle, comp_class, comp_name):
+    subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    params = unreal.AddNewSubobjectParams(parent_handle=parent_handle,
+                                          new_class=comp_class,
+                                          blueprint_context=bp,
+                                          skip_mark_blueprint_modified=False,
+                                          conform_transform_to_parent=False)
+    result = subsystem.add_new_subobject(params)
+    if isinstance(result, tuple):
+        handle = result[0]
+        fail_reason = result[1] if len(result) > 1 else ''
+    else:
+        handle = result
+        fail_reason = ''
+    if not is_valid_handle(handle):
+        raise RuntimeError('add_new_subobject(%s) returned invalid handle: %s' % (comp_name, fail_reason))
+    try:
+        subsystem.rename_subobject(handle, unreal.Text(comp_name))
+    except Exception:
+        try:
+            subsystem.rename_subobject(handle, comp_name)
+        except Exception as e:
+            strategies.append('rename %s failed: %s' % (comp_name, e))
+    return handle, obj_from_handle(bp, handle)
+
+if bool_arg('addCamera', True):
+    if not hasattr(unreal, 'SubobjectDataSubsystem') or not hasattr(unreal, 'AddNewSubobjectParams'):
+        strategies.append('SubobjectDataSubsystem unavailable; camera components not authored')
+    else:
+        try:
+            subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+            handles = subsystem.k2_gather_subobject_data_for_blueprint(context=bp)
+            parent = find_parent_handle(bp, subsystem, handles)
+            if parent is None:
+                raise RuntimeError('no parent subobject handle found')
+            boom_handle, boom = add_component(bp, parent, unreal.SpringArmComponent, 'CameraBoom')
+            if boom is not None:
+                safe_set(boom, 'target_arm_length', num('cameraBoomLength', 350.0), 'cameraBoom.targetArmLength')
+                safe_set(boom, 'use_pawn_control_rotation', True, 'cameraBoom.usePawnControlRotation')
+                safe_set(boom, 'do_collision_test', True, 'cameraBoom.doCollisionTest')
+                safe_set(boom, 'socket_offset', vec_arg('cameraSocketOffset', (0.0, 45.0, 65.0)), 'cameraBoom.socketOffset')
+                camera_components.append('CameraBoom')
+            cam_handle, cam = add_component(bp, boom_handle, unreal.CameraComponent, 'FollowCamera')
+            if cam is not None:
+                safe_set(cam, 'use_pawn_control_rotation', False, 'camera.usePawnControlRotation')
+                camera_components.append('FollowCamera')
+            camera_added = 'CameraBoom' in camera_components and 'FollowCamera' in camera_components
+            strategies.append('SubobjectDataSubsystem SpringArm+Camera OK')
+        except Exception as e:
+            strategies.append('SubobjectDataSubsystem SpringArm+Camera failed: %s' % e)
+
+compile_bp(bp)
+unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+_emit({'ok': True,
+       'assetPath': bp.get_path_name(),
+       'parentClass': 'Character',
+       'configured': configured,
+       'warnings': warnings,
+       'cameraAdded': camera_added,
+       'cameraComponents': camera_components,
+       'strategiesTried': strategies})
+)PY";
+            if (arg_str(args, "name").empty() || arg_str(args, "packagePath").empty())
+                return ToolResult::error("name and packagePath are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_configure_character_movement ------------------------------------
+    add(Tool{
+        "ue_configure_character_movement",
+        "Configure an existing Character Blueprint for grounded third-person "
+        "movement: CharacterMovement walking speed, gravity, jump, air control, "
+        "step height, walkable floor angle, rotation-to-movement, capsule size, "
+        "mesh transform, and optional animation blueprint. Python recipe; "
+        "requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"animBlueprintPath", {{"type", "string"}}},
+               {"meshOffset", {{"type", "object"}}},
+               {"meshRotation", {{"type", "object"}}},
+               {"meshScale", {{"type", "object"}}},
+               {"capsuleRadius", {{"type", "number"}}},
+               {"capsuleHalfHeight", {{"type", "number"}}},
+               {"maxWalkSpeed", {{"type", "number"}}},
+               {"maxAcceleration", {{"type", "number"}}},
+               {"brakingDecelerationWalking", {{"type", "number"}}},
+               {"groundFriction", {{"type", "number"}}},
+               {"gravityScale", {{"type", "number"}}},
+               {"jumpZVelocity", {{"type", "number"}}},
+               {"airControl", {{"type", "number"}}},
+               {"maxStepHeight", {{"type", "number"}}},
+               {"walkableFloorAngle", {{"type", "number"}}},
+               {"rotationRateYaw", {{"type", "number"}}},
+               {"orientRotationToMovement", {{"type", "boolean"}}},
+               {"useControllerYawRotation", {{"type", "boolean"}}}}},
+             {"required", json::array({"blueprintPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if bp is None:
+    raise RuntimeError('could not load blueprint: %s' % _ARGS['blueprintPath'])
+
+configured = []
+warnings = []
+
+def num(key, default):
+    try:
+        return float(_ARGS.get(key, default))
+    except Exception:
+        return float(default)
+
+def bool_arg(key, default):
+    return bool(_ARGS.get(key, default))
+
+def vec_arg(key, default):
+    src = _ARGS.get(key) or {}
+    return unreal.Vector(float(src.get('x', default[0])),
+                         float(src.get('y', default[1])),
+                         float(src.get('z', default[2])))
+
+def rot_arg(key, default):
+    src = _ARGS.get(key) or {}
+    return unreal.Rotator(float(src.get('pitch', default[0])),
+                          float(src.get('yaw', default[1])),
+                          float(src.get('roll', default[2])))
+
+def warn(msg):
+    warnings.append(str(msg))
+
+def safe_set(obj, prop, value, label):
+    try:
+        obj.set_editor_property(prop, value)
+        configured.append(label)
+        return True
+    except Exception as e:
+        warn('%s failed: %s' % (label, e))
+        return False
+
+def compile_bp(asset):
+    if hasattr(unreal, 'BlueprintEditorLibrary'):
+        unreal.BlueprintEditorLibrary.compile_blueprint(asset)
+
+def generated_class(asset):
+    try:
+        return asset.get_editor_property('generated_class')
+    except Exception:
+        return getattr(asset, 'generated_class', None)
+
+def first_component(cdo, prop_names, cls):
+    for prop in prop_names:
+        try:
+            obj = cdo.get_editor_property(prop)
+            if obj is not None:
+                return obj
+        except Exception:
+            pass
+    try:
+        comps = cdo.get_components_by_class(cls)
+        if comps:
+            return comps[0]
+    except Exception:
+        pass
+    try:
+        return cdo.get_component_by_class(cls)
+    except Exception:
+        return None
+
+compile_bp(bp)
+cls = generated_class(bp)
+if cls is None:
+    raise RuntimeError('blueprint has no generated class: %s' % bp.get_path_name())
+cdo = unreal.get_default_object(cls)
+if cdo is None:
+    raise RuntimeError('could not get class default object: %s' % bp.get_path_name())
+
+safe_set(cdo, 'use_controller_rotation_yaw', bool_arg('useControllerYawRotation', False), 'character.useControllerYawRotation')
+safe_set(cdo, 'use_controller_rotation_pitch', False, 'character.useControllerRotationPitch')
+safe_set(cdo, 'use_controller_rotation_roll', False, 'character.useControllerRotationRoll')
+
+capsule = first_component(cdo, ['capsule_component'], unreal.CapsuleComponent)
+if capsule is None:
+    warn('CapsuleComponent not found')
+else:
+    radius = num('capsuleRadius', 34.0)
+    half_height = num('capsuleHalfHeight', 88.0)
+    try:
+        capsule.set_capsule_size(radius, half_height, True)
+        configured.append('capsule.size')
+    except Exception as e:
+        warn('capsule.set_capsule_size failed: %s' % e)
+        safe_set(capsule, 'capsule_radius', radius, 'capsule.radius')
+        safe_set(capsule, 'capsule_half_height', half_height, 'capsule.halfHeight')
+
+mesh = first_component(cdo, ['mesh'], unreal.SkeletalMeshComponent)
+if mesh is None:
+    warn('SkeletalMeshComponent not found')
+else:
+    safe_set(mesh, 'relative_location', vec_arg('meshOffset', (0.0, 0.0, -88.0)), 'mesh.relativeLocation')
+    safe_set(mesh, 'relative_rotation', rot_arg('meshRotation', (0.0, -90.0, 0.0)), 'mesh.relativeRotation')
+    safe_set(mesh, 'relative_scale3d', vec_arg('meshScale', (1.0, 1.0, 1.0)), 'mesh.relativeScale')
+    anim_path = _ARGS.get('animBlueprintPath') or ''
+    if anim_path:
+        anim = unreal.EditorAssetLibrary.load_asset(anim_path)
+        if anim is None:
+            warn('could not load animation blueprint: %s' % anim_path)
+        else:
+            anim_class = None
+            try:
+                anim_class = anim.get_editor_property('generated_class')
+            except Exception:
+                pass
+            if anim_class is None and anim_path.endswith('_C'):
+                try:
+                    anim_class = unreal.load_object(None, anim_path)
+                except Exception:
+                    anim_class = None
+            if anim_class is None:
+                warn('animation blueprint generated class unavailable: %s' % anim_path)
+            else:
+                try:
+                    mesh.set_animation_mode(unreal.AnimationMode.ANIMATION_BLUEPRINT)
+                    configured.append('mesh.animationMode')
+                except Exception as e:
+                    warn('mesh.set_animation_mode failed: %s' % e)
+                try:
+                    mesh.set_anim_instance_class(anim_class)
+                    configured.append('mesh.animClass')
+                except Exception as e:
+                    warn('mesh.set_anim_instance_class failed: %s' % e)
+
+movement = first_component(cdo, ['character_movement'], unreal.CharacterMovementComponent)
+if movement is None:
+    warn('CharacterMovementComponent not found; blueprint may not inherit Character')
+else:
+    safe_set(movement, 'movement_mode', getattr(unreal.MovementMode, 'MOVE_Walking', 1), 'movement.modeWalking')
+    safe_set(movement, 'max_walk_speed', num('maxWalkSpeed', 500.0), 'movement.maxWalkSpeed')
+    safe_set(movement, 'max_acceleration', num('maxAcceleration', 2048.0), 'movement.maxAcceleration')
+    safe_set(movement, 'braking_deceleration_walking', num('brakingDecelerationWalking', 2048.0), 'movement.brakingDecelerationWalking')
+    safe_set(movement, 'ground_friction', num('groundFriction', 8.0), 'movement.groundFriction')
+    safe_set(movement, 'gravity_scale', num('gravityScale', 1.0), 'movement.gravityScale')
+    safe_set(movement, 'jump_z_velocity', num('jumpZVelocity', 700.0), 'movement.jumpZVelocity')
+    safe_set(movement, 'air_control', num('airControl', 0.35), 'movement.airControl')
+    safe_set(movement, 'max_step_height', num('maxStepHeight', 45.0), 'movement.maxStepHeight')
+    safe_set(movement, 'walkable_floor_angle', num('walkableFloorAngle', 44.0), 'movement.walkableFloorAngle')
+    safe_set(movement, 'orient_rotation_to_movement', bool_arg('orientRotationToMovement', True), 'movement.orientRotationToMovement')
+    safe_set(movement, 'rotation_rate', unreal.Rotator(0.0, num('rotationRateYaw', 540.0), 0.0), 'movement.rotationRate')
+
+compile_bp(bp)
+unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+_emit({'ok': True, 'assetPath': bp.get_path_name(), 'configured': configured, 'warnings': warnings})
+)PY";
+            if (arg_str(args, "blueprintPath").empty())
+                return ToolResult::error("blueprintPath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_calibrate_character_collision -----------------------------------
+    add(Tool{
+        "ue_calibrate_character_collision",
+        "Calibrate a Character Blueprint's capsule collision and mesh offset for "
+        "a target real-world height. Defaults targetHeightCm=180, "
+        "capsuleRadiusCm=34, and footOffsetCm=0. Also sets sensible Pawn "
+        "collision profiles when exposed by Python. Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"targetHeightCm", {{"type", "number"}}},
+               {"capsuleRadiusCm", {{"type", "number"}}},
+               {"capsuleHalfHeightCm", {{"type", "number"}}},
+               {"footOffsetCm", {{"type", "number"}}},
+               {"meshOffset", {{"type", "object"}}}}},
+             {"required", json::array({"blueprintPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if bp is None:
+    raise RuntimeError('could not load blueprint: %s' % _ARGS['blueprintPath'])
+
+configured = []
+warnings = []
+
+def num(key, default):
+    try:
+        return float(_ARGS.get(key, default))
+    except Exception:
+        return float(default)
+
+def safe_set(obj, prop, value, label):
+    try:
+        obj.set_editor_property(prop, value)
+        configured.append(label)
+        return True
+    except Exception as e:
+        warnings.append('%s failed: %s' % (label, e))
+        return False
+
+def compile_bp(asset):
+    if hasattr(unreal, 'BlueprintEditorLibrary'):
+        unreal.BlueprintEditorLibrary.compile_blueprint(asset)
+
+def generated_class(asset):
+    try:
+        return asset.get_editor_property('generated_class')
+    except Exception:
+        return getattr(asset, 'generated_class', None)
+
+def first_component(cdo, prop_names, cls):
+    for prop in prop_names:
+        try:
+            obj = cdo.get_editor_property(prop)
+            if obj is not None:
+                return obj
+        except Exception:
+            pass
+    try:
+        comps = cdo.get_components_by_class(cls)
+        if comps:
+            return comps[0]
+    except Exception:
+        pass
+    try:
+        return cdo.get_component_by_class(cls)
+    except Exception:
+        return None
+
+compile_bp(bp)
+cls = generated_class(bp)
+if cls is None:
+    raise RuntimeError('blueprint has no generated class: %s' % bp.get_path_name())
+cdo = unreal.get_default_object(cls)
+if cdo is None:
+    raise RuntimeError('could not get class default object: %s' % bp.get_path_name())
+
+target_height = num('targetHeightCm', 180.0)
+half_height = num('capsuleHalfHeightCm', target_height * 0.5)
+radius = num('capsuleRadiusCm', min(half_height * 0.45, max(target_height * 0.19, 22.0)))
+foot_offset = num('footOffsetCm', 0.0)
+mesh_offset_arg = _ARGS.get('meshOffset') or {}
+mesh_offset = unreal.Vector(float(mesh_offset_arg.get('x', 0.0)),
+                            float(mesh_offset_arg.get('y', 0.0)),
+                            float(mesh_offset_arg.get('z', -half_height + foot_offset)))
+
+capsule = first_component(cdo, ['capsule_component'], unreal.CapsuleComponent)
+if capsule is None:
+    warnings.append('CapsuleComponent not found')
+else:
+    try:
+        capsule.set_capsule_size(radius, half_height, True)
+        configured.append('capsule.size')
+    except Exception as e:
+        warnings.append('capsule.set_capsule_size failed: %s' % e)
+        safe_set(capsule, 'capsule_radius', radius, 'capsule.radius')
+        safe_set(capsule, 'capsule_half_height', half_height, 'capsule.halfHeight')
+    try:
+        capsule.set_collision_profile_name('Pawn')
+        configured.append('capsule.collisionProfilePawn')
+    except Exception as e:
+        warnings.append('capsule.set_collision_profile_name failed: %s' % e)
+    if hasattr(unreal, 'CollisionEnabled'):
+        safe_set(capsule, 'collision_enabled', getattr(unreal.CollisionEnabled, 'QUERY_AND_PHYSICS', getattr(unreal.CollisionEnabled, 'QueryAndPhysics', 3)), 'capsule.collisionEnabled')
+
+mesh = first_component(cdo, ['mesh'], unreal.SkeletalMeshComponent)
+if mesh is None:
+    warnings.append('SkeletalMeshComponent not found')
+else:
+    safe_set(mesh, 'relative_location', mesh_offset, 'mesh.relativeLocation')
+    try:
+        mesh.set_collision_profile_name('CharacterMesh')
+        configured.append('mesh.collisionProfileCharacterMesh')
+    except Exception as e:
+        warnings.append('mesh.set_collision_profile_name failed: %s' % e)
+    if hasattr(unreal, 'CollisionEnabled'):
+        safe_set(mesh, 'collision_enabled', getattr(unreal.CollisionEnabled, 'NO_COLLISION', getattr(unreal.CollisionEnabled, 'NoCollision', 0)), 'mesh.noCollision')
+
+compile_bp(bp)
+unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+_emit({'ok': True, 'assetPath': bp.get_path_name(),
+       'targetHeightCm': target_height,
+       'capsuleRadiusCm': radius,
+       'capsuleHalfHeightCm': half_height,
+       'meshOffset': {'x': mesh_offset.x, 'y': mesh_offset.y, 'z': mesh_offset.z},
+       'configured': configured,
+       'warnings': warnings})
+)PY";
+            if (arg_str(args, "blueprintPath").empty())
+                return ToolResult::error("blueprintPath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_configure_third_person_camera -----------------------------------
+    add(Tool{
+        "ue_configure_third_person_camera",
+        "Add or update a Character Blueprint's third-person SpringArm + Camera. "
+        "Configures arm length, shoulder socket offset, collision testing, camera "
+        "lag / rotation lag, and camera control rotation. Component authoring uses "
+        "SubobjectDataSubsystem when available. Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"cameraBoomName", {{"type", "string"}}},
+               {"cameraName", {{"type", "string"}}},
+               {"targetArmLength", {{"type", "number"}}},
+               {"socketOffset", {{"type", "object"}}},
+               {"relativeLocation", {{"type", "object"}}},
+               {"doCollisionTest", {{"type", "boolean"}}},
+               {"probeSize", {{"type", "number"}}},
+               {"enableCameraLag", {{"type", "boolean"}}},
+               {"cameraLagSpeed", {{"type", "number"}}},
+               {"enableCameraRotationLag", {{"type", "boolean"}}},
+               {"cameraRotationLagSpeed", {{"type", "number"}}},
+               {"usePawnControlRotation", {{"type", "boolean"}}}}},
+             {"required", json::array({"blueprintPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if bp is None:
+    raise RuntimeError('could not load blueprint: %s' % _ARGS['blueprintPath'])
+
+configured = []
+warnings = []
+strategies = []
+boom_name = _ARGS.get('cameraBoomName') or 'CameraBoom'
+camera_name = _ARGS.get('cameraName') or 'FollowCamera'
+
+def num(key, default):
+    try:
+        return float(_ARGS.get(key, default))
+    except Exception:
+        return float(default)
+
+def bool_arg(key, default):
+    return bool(_ARGS.get(key, default))
+
+def vec_arg(key, default):
+    src = _ARGS.get(key) or {}
+    return unreal.Vector(float(src.get('x', default[0])),
+                         float(src.get('y', default[1])),
+                         float(src.get('z', default[2])))
+
+def safe_set(obj, prop, value, label):
+    try:
+        obj.set_editor_property(prop, value)
+        configured.append(label)
+        return True
+    except Exception as e:
+        warnings.append('%s failed: %s' % (label, e))
+        return False
+
+def compile_bp(asset):
+    if hasattr(unreal, 'BlueprintEditorLibrary'):
+        unreal.BlueprintEditorLibrary.compile_blueprint(asset)
+
+def generated_class(asset):
+    try:
+        return asset.get_editor_property('generated_class')
+    except Exception:
+        return getattr(asset, 'generated_class', None)
+
+def comp_name(comp):
+    try:
+        return comp.get_name()
+    except Exception:
+        return ''
+
+def components(cdo, cls):
+    try:
+        return list(cdo.get_components_by_class(cls))
+    except Exception:
+        try:
+            c = cdo.get_component_by_class(cls)
+            return [c] if c is not None else []
+        except Exception:
+            return []
+
+def find_component(cdo, cls, wanted):
+    comps = components(cdo, cls)
+    for c in comps:
+        if comp_name(c) == wanted:
+            return c
+    return comps[0] if comps else None
+
+def obj_from_handle(asset, handle):
+    bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+    data = bfl.get_data(handle)
+    try:
+        return bfl.get_object_for_blueprint(data, asset)
+    except Exception:
+        return bfl.get_object(data)
+
+def is_valid_handle(handle):
+    try:
+        return unreal.SubobjectDataBlueprintFunctionLibrary.is_handle_valid(handle)
+    except Exception:
+        return handle is not None
+
+def root_handle(asset):
+    subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    handles = subsystem.k2_gather_subobject_data_for_blueprint(context=asset)
+    bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+    fallback = handles[0] if handles else None
+    for handle in handles:
+        try:
+            data = bfl.get_data(handle)
+            if bfl.is_root_component(data) or str(bfl.get_variable_name(data)) == 'CapsuleComponent':
+                return handle
+        except Exception:
+            pass
+    return fallback
+
+def add_component(asset, parent_handle, comp_class, name):
+    subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    params = unreal.AddNewSubobjectParams(parent_handle=parent_handle,
+                                          new_class=comp_class,
+                                          blueprint_context=asset,
+                                          skip_mark_blueprint_modified=False,
+                                          conform_transform_to_parent=False)
+    result = subsystem.add_new_subobject(params)
+    handle = result[0] if isinstance(result, tuple) else result
+    fail_reason = result[1] if isinstance(result, tuple) and len(result) > 1 else ''
+    if not is_valid_handle(handle):
+        raise RuntimeError('add_new_subobject(%s) returned invalid handle: %s' % (name, fail_reason))
+    try:
+        subsystem.rename_subobject(handle, unreal.Text(name))
+    except Exception:
+        try:
+            subsystem.rename_subobject(handle, name)
+        except Exception as e:
+            strategies.append('rename %s failed: %s' % (name, e))
+    return handle, obj_from_handle(asset, handle)
+
+compile_bp(bp)
+cls = generated_class(bp)
+if cls is None:
+    raise RuntimeError('blueprint has no generated class: %s' % bp.get_path_name())
+cdo = unreal.get_default_object(cls)
+if cdo is None:
+    raise RuntimeError('could not get class default object: %s' % bp.get_path_name())
+
+boom = find_component(cdo, unreal.SpringArmComponent, boom_name)
+cam = find_component(cdo, unreal.CameraComponent, camera_name)
+
+if (boom is None or cam is None):
+    if not hasattr(unreal, 'SubobjectDataSubsystem') or not hasattr(unreal, 'AddNewSubobjectParams'):
+        warnings.append('SubobjectDataSubsystem unavailable; missing camera components were not authored')
+    else:
+        try:
+            parent = root_handle(bp)
+            if parent is None:
+                raise RuntimeError('no parent component handle found')
+            if boom is None:
+                boom_handle, boom = add_component(bp, parent, unreal.SpringArmComponent, boom_name)
+                strategies.append('added SpringArmComponent')
+            else:
+                boom_handle = parent
+            if cam is None:
+                cam_handle, cam = add_component(bp, boom_handle, unreal.CameraComponent, camera_name)
+                strategies.append('added CameraComponent')
+        except Exception as e:
+            warnings.append('component authoring failed: %s' % e)
+
+compile_bp(bp)
+cls = generated_class(bp)
+cdo = unreal.get_default_object(cls)
+boom = find_component(cdo, unreal.SpringArmComponent, boom_name)
+cam = find_component(cdo, unreal.CameraComponent, camera_name)
+
+if boom is None:
+    warnings.append('SpringArmComponent not found after configure attempt')
+else:
+    safe_set(boom, 'target_arm_length', num('targetArmLength', 350.0), 'cameraBoom.targetArmLength')
+    safe_set(boom, 'socket_offset', vec_arg('socketOffset', (0.0, 45.0, 65.0)), 'cameraBoom.socketOffset')
+    safe_set(boom, 'relative_location', vec_arg('relativeLocation', (0.0, 0.0, 65.0)), 'cameraBoom.relativeLocation')
+    safe_set(boom, 'use_pawn_control_rotation', bool_arg('usePawnControlRotation', True), 'cameraBoom.usePawnControlRotation')
+    safe_set(boom, 'do_collision_test', bool_arg('doCollisionTest', True), 'cameraBoom.doCollisionTest')
+    safe_set(boom, 'probe_size', num('probeSize', 12.0), 'cameraBoom.probeSize')
+    safe_set(boom, 'enable_camera_lag', bool_arg('enableCameraLag', True), 'cameraBoom.enableCameraLag')
+    safe_set(boom, 'camera_lag_speed', num('cameraLagSpeed', 12.0), 'cameraBoom.cameraLagSpeed')
+    safe_set(boom, 'enable_camera_rotation_lag', bool_arg('enableCameraRotationLag', False), 'cameraBoom.enableCameraRotationLag')
+    safe_set(boom, 'camera_rotation_lag_speed', num('cameraRotationLagSpeed', 12.0), 'cameraBoom.cameraRotationLagSpeed')
+
+if cam is None:
+    warnings.append('CameraComponent not found after configure attempt')
+else:
+    safe_set(cam, 'use_pawn_control_rotation', False, 'camera.usePawnControlRotation')
+
+compile_bp(bp)
+unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+_emit({'ok': True, 'assetPath': bp.get_path_name(),
+       'cameraAdded': boom is not None and cam is not None,
+       'cameraBoom': comp_name(boom) if boom is not None else '',
+       'camera': comp_name(cam) if cam is not None else '',
+       'configured': configured,
+       'warnings': warnings,
+       'strategiesTried': strategies})
+)PY";
+            if (arg_str(args, "blueprintPath").empty())
+                return ToolResult::error("blueprintPath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_create_enhanced_input_assets ------------------------------------
+    add(Tool{
+        "ue_create_enhanced_input_assets",
+        "Create a standard UE5 Enhanced Input third-person asset set: IA_Move "
+        "(Axis2D), IA_Look (Axis2D), IA_Jump (Boolean), and an Input Mapping "
+        "Context with WASD, mouse X/Y, and SpaceBar mappings. It also tries to "
+        "author the usual Negate / Swizzle / Scalar modifiers for keyboard "
+        "2D movement and look sensitivity. Python recipe; requires "
+        "PythonScriptPlugin and the EnhancedInput editor classes.",
+        json{{"type", "object"},
+             {"properties",
+              {{"packagePath", {{"type", "string"}}},
+               {"contextName", {{"type", "string"}}},
+               {"moveActionName", {{"type", "string"}}},
+               {"lookActionName", {{"type", "string"}}},
+               {"jumpActionName", {{"type", "string"}}},
+               {"mouseSensitivity", {{"type", "number"}}},
+               {"invertMouseY", {{"type", "boolean"}}},
+               {"reuseExisting", {{"type", "boolean"}}}}},
+             {"required", json::array({"packagePath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+pkg = _ARGS['packagePath'].rstrip('/')
+context_name = _ARGS.get('contextName') or 'IMC_Default'
+move_name = _ARGS.get('moveActionName') or 'IA_Move'
+look_name = _ARGS.get('lookActionName') or 'IA_Look'
+jump_name = _ARGS.get('jumpActionName') or 'IA_Jump'
+reuse = bool(_ARGS.get('reuseExisting', False))
+mouse_sensitivity = float(_ARGS.get('mouseSensitivity', 1.0))
+invert_mouse_y = bool(_ARGS.get('invertMouseY', False))
+created = {}
+configured = []
+warnings = []
+mapped = []
+
+def unsupported(msg):
+    raise RuntimeError('__UNSUPPORTED__:' + msg)
+
+def cls_any(names):
+    for name in names:
+        obj = getattr(unreal, name, None)
+        if obj is not None:
+            return obj
+    return None
+
+input_action_cls = cls_any(['InputAction'])
+input_context_cls = cls_any(['InputMappingContext'])
+input_action_factory_cls = cls_any(['InputAction_Factory', 'InputActionFactory'])
+input_context_factory_cls = cls_any(['InputMappingContext_Factory', 'InputMappingContextFactory'])
+if input_action_cls is None or input_context_cls is None:
+    unsupported('EnhancedInput runtime classes are unavailable; enable the EnhancedInput plugin')
+if input_action_factory_cls is None or input_context_factory_cls is None:
+    unsupported('EnhancedInput editor factories are unavailable; enable the InputEditor module/plugin')
+
+def asset_path(name):
+    return pkg + '/' + name
+
+def create_or_load(name, asset_cls, factory_cls, factory_prop=None):
+    path = asset_path(name)
+    if unreal.EditorAssetLibrary.does_asset_exist(path):
+        if not reuse:
+            raise RuntimeError('asset already exists; pass reuseExisting=true: %s' % path)
+        asset = unreal.EditorAssetLibrary.load_asset(path)
+        if asset is None:
+            raise RuntimeError('asset exists but could not be loaded: %s' % path)
+        created[name] = path
+        return asset
+    factory = factory_cls()
+    if factory_prop:
+        try:
+            factory.set_editor_property(factory_prop, asset_cls)
+        except Exception as e:
+            warnings.append('factory.%s failed for %s: %s' % (factory_prop, name, e))
+    asset = unreal.AssetToolsHelpers.get_asset_tools().create_asset(name, pkg, asset_cls, factory)
+    if asset is None:
+        raise RuntimeError('create_asset returned None: %s' % path)
+    created[name] = asset.get_path_name()
+    return asset
+
+def enum_value(enum_names, candidates):
+    for enum_name in enum_names:
+        enum_cls = getattr(unreal, enum_name, None)
+        if enum_cls is None:
+            continue
+        for cand in candidates:
+            if hasattr(enum_cls, cand):
+                return getattr(enum_cls, cand)
+    return None
+
+def set_value_type(action, logical):
+    if logical == 'axis2d':
+        val = enum_value(['InputActionValueType', 'EInputActionValueType'],
+                         ['AXIS2D', 'AXIS_2D', 'Axis2D'])
+    else:
+        val = enum_value(['InputActionValueType', 'EInputActionValueType'],
+                         ['BOOLEAN', 'Boolean'])
+    if val is None:
+        warnings.append('InputActionValueType enum value unavailable for %s' % logical)
+        return
+    try:
+        action.set_editor_property('value_type', val)
+        configured.append(action.get_name() + '.valueType')
+    except Exception as e:
+        warnings.append('set value_type failed for %s: %s' % (action.get_name(), e))
+
+move = create_or_load(move_name, input_action_cls, input_action_factory_cls, 'input_action_class')
+look = create_or_load(look_name, input_action_cls, input_action_factory_cls, 'input_action_class')
+jump = create_or_load(jump_name, input_action_cls, input_action_factory_cls, 'input_action_class')
+context = create_or_load(context_name, input_context_cls, input_context_factory_cls, 'input_mapping_context_class')
+
+set_value_type(move, 'axis2d')
+set_value_type(look, 'axis2d')
+set_value_type(jump, 'boolean')
+try:
+    context.unmap_all()
+    configured.append(context.get_name() + '.unmapAll')
+except Exception as e:
+    warnings.append('context.unmap_all failed; duplicate mappings may remain: %s' % e)
+
+def new_modifier(cls_name, props=None):
+    cls = cls_any([cls_name])
+    if cls is None:
+        warnings.append('modifier class unavailable: %s' % cls_name)
+        return None
+    obj = unreal.new_object(cls, context)
+    for key, value in (props or {}).items():
+        try:
+            obj.set_editor_property(key, value)
+        except Exception as e:
+            warnings.append('modifier.%s set %s failed: %s' % (cls_name, key, e))
+    return obj
+
+def negate():
+    return new_modifier('InputModifierNegate')
+
+def swizzle_yxz():
+    order = enum_value(['InputAxisSwizzle', 'EInputAxisSwizzle'], ['YXZ'])
+    props = {'order': order} if order is not None else {}
+    return new_modifier('InputModifierSwizzleAxis', props)
+
+def scalar(x=1.0, y=1.0, z=1.0):
+    return new_modifier('InputModifierScalar', {'scalar': unreal.Vector(float(x), float(y), float(z))})
+
+def key_obj(name):
+    try:
+        return unreal.Key(name)
+    except Exception:
+        return name
+
+def apply_modifiers(mapping, modifiers, label):
+    mods = [m for m in modifiers if m is not None]
+    if not mods:
+        return
+    try:
+        mapping.set_editor_property('modifiers', mods)
+        configured.append(label + '.modifiers')
+    except Exception as e:
+        warnings.append('%s set modifiers failed: %s' % (label, e))
+
+def map_key(action, key_name, modifiers=None):
+    try:
+        mapping = context.map_key(action, key_obj(key_name))
+        label = '%s:%s' % (action.get_name(), key_name)
+        mapped.append(label)
+        apply_modifiers(mapping, modifiers or [], label)
+    except Exception as e:
+        warnings.append('map_key %s -> %s failed: %s' % (action.get_name(), key_name, e))
+
+map_key(move, 'W', [swizzle_yxz()])
+map_key(move, 'S', [negate(), swizzle_yxz()])
+map_key(move, 'A', [negate()])
+map_key(move, 'D', [])
+map_key(look, 'MouseX', [scalar(mouse_sensitivity, mouse_sensitivity, 1.0)] if mouse_sensitivity != 1.0 else [])
+look_y_mods = [swizzle_yxz()]
+if invert_mouse_y:
+    look_y_mods.insert(0, negate())
+if mouse_sensitivity != 1.0:
+    look_y_mods.append(scalar(mouse_sensitivity, mouse_sensitivity, 1.0))
+map_key(look, 'MouseY', look_y_mods)
+map_key(jump, 'SpaceBar', [])
+
+for asset in (move, look, jump, context):
+    unreal.EditorAssetLibrary.save_asset(asset.get_path_name())
+
+_emit({'ok': True,
+       'assetPaths': {'move': move.get_path_name(), 'look': look.get_path_name(),
+                      'jump': jump.get_path_name(), 'mappingContext': context.get_path_name()},
+       'configured': configured,
+       'mapped': mapped,
+       'warnings': warnings})
+)PY";
+            if (arg_str(args, "packagePath").empty())
+                return ToolResult::error("packagePath is required");
+            ToolResult r = run_python_recipe(ctx, kRecipe, args);
+            if (r.is_error && r.payload.is_object()) {
+                std::string err = r.payload.value("error", "");
+                if (err.find("__UNSUPPORTED__:") != std::string::npos) {
+                    json extra = r.payload;
+                    extra.erase("status");
+                    extra.erase("error");
+                    return ToolResult::unsupported(
+                        err.substr(err.find("__UNSUPPORTED__:") + 16),
+                        std::move(extra));
+                }
+            }
+            return r;
+        }});
+
+    // -- ue_create_locomotion_animation_assets ------------------------------
+    add(Tool{
+        "ue_create_locomotion_animation_assets",
+        "Create a locomotion animation asset scaffold for a Character: an "
+        "Animation Blueprint and a 1D speed BlendSpace targeting a skeleton, "
+        "with optional idle/walk/run AnimationSequence samples when this engine's "
+        "Python API exposes BlendSpace sample editing. Python recipe; requires "
+        "PythonScriptPlugin and animation editor factories.",
+        json{{"type", "object"},
+             {"properties",
+              {{"packagePath", {{"type", "string"}}},
+               {"namePrefix", {{"type", "string"}}},
+               {"skeletonPath", {{"type", "string"}}},
+               {"previewMeshPath", {{"type", "string"}}},
+               {"idleAnimationPath", {{"type", "string"}}},
+               {"walkAnimationPath", {{"type", "string"}}},
+               {"runAnimationPath", {{"type", "string"}}},
+               {"walkSpeed", {{"type", "number"}}},
+               {"runSpeed", {{"type", "number"}}},
+               {"reuseExisting", {{"type", "boolean"}}}}},
+             {"required", json::array({"packagePath", "skeletonPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+pkg = _ARGS['packagePath'].rstrip('/')
+prefix = _ARGS.get('namePrefix') or 'Hero'
+reuse = bool(_ARGS.get('reuseExisting', False))
+walk_speed = float(_ARGS.get('walkSpeed', 200.0))
+run_speed = float(_ARGS.get('runSpeed', 500.0))
+created = {}
+configured = []
+warnings = []
+
+def unsupported(msg):
+    raise RuntimeError('__UNSUPPORTED__:' + msg)
+
+def cls_any(names):
+    for name in names:
+        obj = getattr(unreal, name, None)
+        if obj is not None:
+            return obj
+    return None
+
+anim_bp_factory_cls = cls_any(['AnimBlueprintFactory'])
+blend_factory_cls = cls_any(['BlendSpaceFactory1D'])
+anim_bp_cls = cls_any(['AnimBlueprint'])
+blend_cls = cls_any(['BlendSpace1D'])
+if anim_bp_factory_cls is None:
+    unsupported('AnimBlueprintFactory is unavailable in this Python environment')
+if blend_factory_cls is None:
+    unsupported('BlendSpaceFactory1D is unavailable in this Python environment')
+if anim_bp_cls is None:
+    unsupported('AnimBlueprint class is unavailable in this Python environment')
+if blend_cls is None:
+    unsupported('BlendSpace1D class is unavailable in this Python environment')
+
+skeleton = unreal.EditorAssetLibrary.load_asset(_ARGS['skeletonPath'])
+if skeleton is None:
+    raise RuntimeError('could not load skeleton: %s' % _ARGS['skeletonPath'])
+preview = None
+if _ARGS.get('previewMeshPath'):
+    preview = unreal.EditorAssetLibrary.load_asset(_ARGS['previewMeshPath'])
+    if preview is None:
+        warnings.append('could not load preview mesh: %s' % _ARGS['previewMeshPath'])
+
+def asset_path(name):
+    return pkg + '/' + name
+
+def create_or_load(name, asset_cls, factory):
+    path = asset_path(name)
+    if unreal.EditorAssetLibrary.does_asset_exist(path):
+        if not reuse:
+            raise RuntimeError('asset already exists; pass reuseExisting=true: %s' % path)
+        asset = unreal.EditorAssetLibrary.load_asset(path)
+        if asset is None:
+            raise RuntimeError('asset exists but could not be loaded: %s' % path)
+        created[name] = path
+        return asset
+    asset = unreal.AssetToolsHelpers.get_asset_tools().create_asset(name, pkg, asset_cls, factory)
+    if asset is None:
+        raise RuntimeError('create_asset returned None: %s' % path)
+    created[name] = asset.get_path_name()
+    return asset
+
+anim_factory = anim_bp_factory_cls()
+try:
+    anim_factory.set_editor_property('target_skeleton', skeleton)
+    configured.append('animBlueprint.targetSkeleton')
+except Exception as e:
+    warnings.append('set anim target_skeleton failed: %s' % e)
+try:
+    anim_factory.set_editor_property('parent_class', unreal.AnimInstance)
+    configured.append('animBlueprint.parentClass')
+except Exception as e:
+    warnings.append('set anim parent_class failed: %s' % e)
+if preview is not None:
+    try:
+        anim_factory.set_editor_property('preview_skeletal_mesh', preview)
+        configured.append('animBlueprint.previewMesh')
+    except Exception as e:
+        warnings.append('set anim preview_skeletal_mesh failed: %s' % e)
+anim_bp = create_or_load('ABP_' + prefix + '_Locomotion', anim_bp_cls, anim_factory)
+
+blend_factory = blend_factory_cls()
+try:
+    blend_factory.set_editor_property('target_skeleton', skeleton)
+    configured.append('blendSpace.targetSkeleton')
+except Exception as e:
+    warnings.append('set blend target_skeleton failed: %s' % e)
+if preview is not None:
+    try:
+        blend_factory.set_editor_property('preview_skeletal_mesh', preview)
+        configured.append('blendSpace.previewMesh')
+    except Exception as e:
+        warnings.append('set blend preview_skeletal_mesh failed: %s' % e)
+blend = create_or_load('BS_' + prefix + '_Speed', blend_cls, blend_factory)
+
+try:
+    params = list(blend.get_editor_property('blend_parameters'))
+    if params:
+        p0 = params[0]
+        p0.set_editor_property('display_name', 'Speed')
+        p0.set_editor_property('min', 0.0)
+        p0.set_editor_property('max', run_speed)
+        p0.set_editor_property('grid_num', 5)
+        blend.set_editor_property('blend_parameters', params)
+        configured.append('blendSpace.speedAxis')
+except Exception as e:
+    warnings.append('configure blend parameters failed: %s' % e)
+
+def add_sample(label, path, speed):
+    if not path:
+        return
+    seq = unreal.EditorAssetLibrary.load_asset(path)
+    if seq is None:
+        warnings.append('could not load %s animation: %s' % (label, path))
+        return
+    try:
+        blend.add_sample(seq, unreal.Vector(float(speed), 0.0, 0.0))
+        configured.append('blendSpace.sample.' + label)
+    except Exception as e:
+        warnings.append('add blend sample %s failed; graph/sample editing may need Layer-3 plugin: %s' % (label, e))
+
+add_sample('idle', _ARGS.get('idleAnimationPath') or '', 0.0)
+add_sample('walk', _ARGS.get('walkAnimationPath') or '', walk_speed)
+add_sample('run', _ARGS.get('runAnimationPath') or '', run_speed)
+
+if hasattr(unreal, 'BlueprintEditorLibrary'):
+    try:
+        unreal.BlueprintEditorLibrary.compile_blueprint(anim_bp)
+        configured.append('animBlueprint.compile')
+    except Exception as e:
+        warnings.append('compile animation blueprint failed: %s' % e)
+unreal.EditorAssetLibrary.save_asset(anim_bp.get_path_name())
+unreal.EditorAssetLibrary.save_asset(blend.get_path_name())
+
+_emit({'ok': True,
+       'assetPaths': {'animBlueprint': anim_bp.get_path_name(),
+                      'blendSpace': blend.get_path_name()},
+       'configured': configured,
+       'warnings': warnings})
+)PY";
+            if (arg_str(args, "packagePath").empty() ||
+                arg_str(args, "skeletonPath").empty())
+                return ToolResult::error("packagePath and skeletonPath are required");
+            ToolResult r = run_python_recipe(ctx, kRecipe, args);
+            if (r.is_error && r.payload.is_object()) {
+                std::string err = r.payload.value("error", "");
+                if (err.find("__UNSUPPORTED__:") != std::string::npos) {
+                    json extra = r.payload;
+                    extra.erase("status");
+                    extra.erase("error");
+                    return ToolResult::unsupported(
+                        err.substr(err.find("__UNSUPPORTED__:") + 16),
+                        std::move(extra));
+                }
+            }
+            return r;
+        }});
+
+    // -- ue_set_game_defaults -----------------------------------------------
+    add(Tool{
+        "ue_set_game_defaults",
+        "Persist project GameMapsSettings: Game Default Map, Editor Startup Map, "
+        "and default GameMode class. Accepts Blueprint asset paths for gameModePath "
+        "and converts them to generated classes. Optionally saves the current "
+        "level first. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"gameDefaultMap", {{"type", "string"}}},
+               {"editorStartupMap", {{"type", "string"}}},
+               {"gameModePath", {{"type", "string"}}},
+               {"saveCurrentLevel", {{"type", "boolean"}}}}},
+             {"required", json::array({})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+configured = []
+warnings = []
+
+def unsupported(msg):
+    raise RuntimeError('__UNSUPPORTED__:' + msg)
+
+settings_cls = getattr(unreal, 'GameMapsSettings', None)
+if settings_cls is None:
+    unsupported('GameMapsSettings is unavailable in this Python environment')
+settings = unreal.get_default_object(settings_cls)
+if settings is None:
+    raise RuntimeError('could not get GameMapsSettings default object')
+
+def object_path(path):
+    if not path:
+        return ''
+    if '.' in path:
+        return path
+    leaf = path.rsplit('/', 1)[-1]
+    return path + '.' + leaf
+
+def class_from_path(path):
+    if not path:
+        return None
+    if path.endswith('_C'):
+        try:
+            return unreal.load_object(None, path)
+        except Exception:
+            return None
+    asset = unreal.EditorAssetLibrary.load_asset(path)
+    if asset is not None:
+        try:
+            cls = asset.get_editor_property('generated_class')
+            if cls is not None:
+                return cls
+        except Exception:
+            pass
+    try:
+        return unreal.load_object(None, object_path(path) + '_C')
+    except Exception:
+        return None
+
+def safe_set(prop, value, label):
+    try:
+        settings.set_editor_property(prop, value)
+        configured.append(label)
+        return True
+    except Exception as e:
+        warnings.append('%s failed: %s' % (label, e))
+        return False
+
+if bool(_ARGS.get('saveCurrentLevel', False)):
+    try:
+        unreal.EditorLevelLibrary.save_current_level()
+        configured.append('level.saveCurrent')
+    except Exception as e:
+        warnings.append('save_current_level failed: %s' % e)
+
+game_map = _ARGS.get('gameDefaultMap') or ''
+editor_map = _ARGS.get('editorStartupMap') or game_map
+if game_map:
+    safe_set('game_default_map', object_path(game_map), 'settings.gameDefaultMap')
+if editor_map:
+    safe_set('editor_startup_map', object_path(editor_map), 'settings.editorStartupMap')
+
+gm_path = _ARGS.get('gameModePath') or ''
+gm_cls = class_from_path(gm_path)
+if gm_path and gm_cls is None:
+    warnings.append('could not resolve gameModePath to class: %s' % gm_path)
+elif gm_cls is not None:
+    safe_set('global_default_game_mode', gm_cls, 'settings.globalDefaultGameMode')
+
+try:
+    settings.save_config()
+    configured.append('settings.saveConfig')
+except Exception as e:
+    warnings.append('settings.save_config failed: %s' % e)
+
+_emit({'ok': True, 'configured': configured, 'warnings': warnings,
+       'gameDefaultMap': game_map, 'editorStartupMap': editor_map,
+       'gameModePath': gm_path})
+)PY";
+            ToolResult r = run_python_recipe(ctx, kRecipe, args);
+            if (r.is_error && r.payload.is_object()) {
+                std::string err = r.payload.value("error", "");
+                if (err.find("__UNSUPPORTED__:") != std::string::npos) {
+                    json extra = r.payload;
+                    extra.erase("status");
+                    extra.erase("error");
+                    return ToolResult::unsupported(
+                        err.substr(err.find("__UNSUPPORTED__:") + 16),
+                        std::move(extra));
+                }
+            }
+            return r;
+        }});
+
+    // -- ue_validate_third_person_pie ---------------------------------------
+    add(Tool{
+        "ue_validate_third_person_pie",
+        "Start or inspect a PIE session and report the Player0 pawn class, "
+        "CharacterMovement presence, camera presence, controller possession, and "
+        "whether a short movement-input tick changes location. Useful as a final "
+        "third-person setup smoke test. Python recipe; requires PythonScriptPlugin "
+        "and PIE control capability.",
+        json{{"type", "object"},
+             {"properties",
+              {{"expectedPawnClassPath", {{"type", "string"}}},
+               {"startPie", {{"type", "boolean"}}},
+               {"stopPie", {{"type", "boolean"}}},
+               {"moveDirection", {{"type", "object"}}},
+               {"moveScale", {{"type", "number"}}},
+               {"steps", {{"type", "integer"}}},
+               {"deltaSeconds", {{"type", "number"}}}}},
+             {"required", json::array({})}},
+        {Capability::PythonScripting, Capability::PieControl},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+import time
+warnings = []
+diagnostics = {}
+
+def bool_arg(key, default):
+    return bool(_ARGS.get(key, default))
+
+def num(key, default):
+    try:
+        return float(_ARGS.get(key, default))
+    except Exception:
+        return float(default)
+
+def call_any(obj, names):
+    for name in names:
+        fn = getattr(obj, name, None)
+        if fn is not None:
+            return fn()
+    raise RuntimeError('none of methods found: %s' % names)
+
+def vec_arg(key, default):
+    src = _ARGS.get(key) or {}
+    return unreal.Vector(float(src.get('x', default[0])),
+                         float(src.get('y', default[1])),
+                         float(src.get('z', default[2])))
+
+def dist(a, b):
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2) ** 0.5
+
+level = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem) if hasattr(unreal, 'LevelEditorSubsystem') else None
+if bool_arg('startPie', True):
+    if level is None:
+        warnings.append('LevelEditorSubsystem unavailable; could not start PIE')
+    else:
+        try:
+            call_any(level, ['editor_request_begin_play', 'EditorRequestBeginPlay'])
+            diagnostics['startPieRequested'] = True
+            time.sleep(0.25)
+        except Exception as e:
+            warnings.append('start PIE failed: %s' % e)
+
+world = None
+try:
+    editor_subsystem = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+    world = editor_subsystem.get_game_world()
+    diagnostics['worldSource'] = 'gameWorld'
+except Exception as e:
+    warnings.append('get_game_world failed: %s' % e)
+if world is None:
+    try:
+        editor_subsystem = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+        world = editor_subsystem.get_editor_world()
+        diagnostics['worldSource'] = 'editorWorld'
+    except Exception as e:
+        warnings.append('get_editor_world failed: %s' % e)
+if world is None:
+    raise RuntimeError('could not resolve PIE or editor world')
+
+pc = unreal.GameplayStatics.get_player_controller(world, 0)
+if pc is None:
+    raise RuntimeError('PlayerController 0 not found')
+pawn = pc.get_pawn()
+if pawn is None:
+    raise RuntimeError('PlayerController 0 has no pawn')
+
+pawn_class = pawn.get_class().get_path_name()
+expected = _ARGS.get('expectedPawnClassPath') or ''
+diagnostics['pawnPath'] = pawn.get_path_name()
+diagnostics['pawnClassPath'] = pawn_class
+diagnostics['expectedPawnClassPath'] = expected
+diagnostics['expectedPawnClassMatches'] = (not expected) or (expected in pawn_class or pawn_class in expected)
+diagnostics['controllerPath'] = pc.get_path_name()
+diagnostics['possessed'] = True
+
+movement = None
+try:
+    movement = pawn.get_component_by_class(unreal.CharacterMovementComponent)
+except Exception:
+    movement = None
+diagnostics['hasCharacterMovement'] = movement is not None
+if movement is not None:
+    try:
+        diagnostics['movementMode'] = str(movement.get_editor_property('movement_mode'))
+    except Exception:
+        pass
+
+try:
+    cameras = list(pawn.get_components_by_class(unreal.CameraComponent))
+except Exception:
+    cameras = []
+diagnostics['cameraCount'] = len(cameras)
+diagnostics['hasCamera'] = len(cameras) > 0
+
+before = pawn.get_actor_location()
+after = before
+manual_tick_used = False
+if movement is not None:
+    direction = vec_arg('moveDirection', (1.0, 0.0, 0.0))
+    scale = num('moveScale', 1.0)
+    steps = int(_ARGS.get('steps', 8))
+    dt = num('deltaSeconds', 1.0 / 30.0)
+    for _i in range(max(1, steps)):
+        try:
+            pawn.add_movement_input(direction, scale, False)
+        except Exception as e:
+            warnings.append('add_movement_input failed: %s' % e)
+            break
+        try:
+            movement.tick_component(dt, unreal.LevelTick.LEVELTICK_All, None)
+            manual_tick_used = True
+        except Exception as e:
+            warnings.append('manual movement tick failed: %s' % e)
+            break
+    after = pawn.get_actor_location()
+
+diagnostics['locationBefore'] = {'x': before.x, 'y': before.y, 'z': before.z}
+diagnostics['locationAfter'] = {'x': after.x, 'y': after.y, 'z': after.z}
+diagnostics['movedDistance'] = dist(before, after)
+diagnostics['movementInputMoved'] = diagnostics['movedDistance'] > 0.1
+diagnostics['manualTickUsed'] = manual_tick_used
+diagnostics['okThirdPersonSmoke'] = bool(diagnostics['expectedPawnClassMatches'] and
+                                         diagnostics['hasCharacterMovement'] and
+                                         diagnostics['hasCamera'])
+
+if bool_arg('stopPie', True):
+    if level is None:
+        warnings.append('LevelEditorSubsystem unavailable; could not stop PIE')
+    else:
+        try:
+            call_any(level, ['editor_request_end_play', 'EditorRequestEndPlay'])
+            diagnostics['stopPieRequested'] = True
+        except Exception as e:
+            warnings.append('stop PIE failed: %s' % e)
+
+_emit({'ok': True, 'diagnostics': diagnostics, 'warnings': warnings})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
     // -- ue_create_widget_blueprint (MULTI-STRATEGY) -------------------------
     add(Tool{
         "ue_create_widget_blueprint",
@@ -2716,6 +5717,974 @@ else:
                 arg_str(args, "widgetName").empty())
                 return ToolResult::error("blueprintPath, widgetType and widgetName are required");
             return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_inspect_widget_blueprint -----------------------------------------
+    add(Tool{
+        "ue_inspect_widget_blueprint",
+        "Inspect a UMG Widget Blueprint's widget tree. Returns root widget, "
+        "named descendants, parent/child relationships, slot types, and common "
+        "text/value properties. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"includeSlotProperties", {{"type", "boolean"}}}}},
+             {"required", json::array({"blueprintPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+def class_name(obj):
+    try:
+        return obj.get_class().get_name()
+    except Exception:
+        return type(obj).__name__
+
+def obj_name(obj):
+    try:
+        return obj.get_name()
+    except Exception:
+        return str(obj)
+
+def jsonable(value):
+    if value is None:
+        return None
+    for keys in (('x', 'y'), ('r', 'g', 'b', 'a'),
+                 ('left', 'top', 'right', 'bottom')):
+        try:
+            return {k: float(getattr(value, k)) for k in keys}
+        except Exception:
+            pass
+    try:
+        return {
+            'minimum': jsonable(value.minimum),
+            'maximum': jsonable(value.maximum),
+        }
+    except Exception:
+        pass
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+def children_of(widget):
+    out = []
+    for method in ('get_children_count', 'GetChildrenCount'):
+        if hasattr(widget, method):
+            try:
+                count = int(getattr(widget, method)())
+                for i in range(count):
+                    child = widget.get_child_at(i)
+                    if child is not None:
+                        out.append(child)
+                return out
+            except Exception:
+                pass
+    for method in ('get_all_children', 'GetAllChildren'):
+        if hasattr(widget, method):
+            try:
+                return list(getattr(widget, method)() or [])
+            except Exception:
+                pass
+    return out
+
+def slot_for(widget):
+    try:
+        return widget.get_editor_property('slot')
+    except Exception:
+        return None
+
+def slot_props(slot):
+    if slot is None or not bool(_ARGS.get('includeSlotProperties', True)):
+        return {}
+    props = {'slotType': class_name(slot)}
+    for prop in ('position', 'size', 'offsets', 'anchors', 'alignment',
+                 'padding', 'horizontal_alignment', 'vertical_alignment',
+                 'z_order', 'auto_size'):
+        try:
+            props[prop] = jsonable(slot.get_editor_property(prop))
+        except Exception:
+            pass
+    return props
+
+def text_value(widget):
+    for method in ('get_text', 'GetText'):
+        if hasattr(widget, method):
+            try:
+                return str(getattr(widget, method)())
+            except Exception:
+                pass
+    try:
+        return str(widget.get_editor_property('text'))
+    except Exception:
+        return None
+
+wbp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if wbp is None:
+    _emit({'ok': False, 'error': 'could not load widget blueprint'})
+else:
+    try:
+        tree = wbp.get_editor_property('widget_tree')
+    except Exception as e:
+        tree = None
+        tree_error = str(e)
+    if tree is None:
+        _emit({'ok': False, 'error': 'widget_tree unavailable', 'details': tree_error if 'tree_error' in globals() else ''})
+    else:
+        try:
+            root = tree.get_editor_property('root_widget')
+        except Exception:
+            root = None
+        widgets = []
+        seen = set()
+        def visit(widget, parent_name):
+            if widget is None:
+                return
+            key = obj_name(widget)
+            if key in seen:
+                return
+            seen.add(key)
+            child_objs = children_of(widget)
+            item = {
+                'name': key,
+                'type': class_name(widget),
+                'parent': parent_name,
+                'children': [obj_name(c) for c in child_objs],
+            }
+            value = text_value(widget)
+            if value is not None:
+                item['text'] = value
+            item.update(slot_props(slot_for(widget)))
+            widgets.append(item)
+            for child in child_objs:
+                visit(child, key)
+        visit(root, '')
+        _emit({'ok': True,
+               'assetPath': wbp.get_path_name(),
+               'root': {'name': obj_name(root), 'type': class_name(root)} if root else None,
+               'widgetCount': len(widgets),
+               'widgets': widgets})
+)PY";
+            if (arg_str(args, "blueprintPath").empty())
+                return ToolResult::error("blueprintPath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_add_widget_to_panel ----------------------------------------------
+    add(Tool{
+        "ue_add_widget_to_panel",
+        "Add a widget to a named UMG panel or content widget. Supports root "
+        "fallback, parentName, text, a properties object, and a layout object "
+        "for CanvasPanelSlot/box/overlay padding and alignment. Python recipe; "
+        "requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"parentName", {{"type", "string"}, {"description", "empty means root widget"}}},
+               {"widgetType", {{"type", "string"}}},
+               {"widgetName", {{"type", "string"}}},
+               {"text", {{"type", "string"}}},
+               {"properties", {{"type", "object"}}},
+               {"layout", {{"type", "object"}}}}},
+             {"required", json::array({"blueprintPath", "widgetType", "widgetName"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+applied = []
+warnings = []
+
+def warn(msg):
+    warnings.append(str(msg))
+
+def vec2(src, default=(0.0, 0.0)):
+    src = src or {}
+    return unreal.Vector2D(float(src.get('x', default[0])),
+                           float(src.get('y', default[1])))
+
+def margin(src):
+    src = src or {}
+    return unreal.Margin(float(src.get('left', 0.0)),
+                         float(src.get('top', 0.0)),
+                         float(src.get('right', 0.0)),
+                         float(src.get('bottom', 0.0)))
+
+def anchors(src):
+    src = src or {}
+    mn = src.get('minimum') or src.get('min') or {}
+    mx = src.get('maximum') or src.get('max') or {}
+    minx = float(mn.get('x', src.get('minX', 0.0)))
+    miny = float(mn.get('y', src.get('minY', 0.0)))
+    maxx = float(mx.get('x', src.get('maxX', minx)))
+    maxy = float(mx.get('y', src.get('maxY', miny)))
+    try:
+        return unreal.Anchors(minimum=unreal.Vector2D(minx, miny),
+                              maximum=unreal.Vector2D(maxx, maxy))
+    except Exception:
+        return unreal.Anchors(minx, miny, maxx, maxy)
+
+def enum_value(enum_type, name, prefix):
+    raw = str(name or '').replace('-', '_').replace(' ', '_')
+    candidates = [
+        raw,
+        raw.upper(),
+        prefix + raw.upper(),
+        prefix + '_' + raw.upper(),
+        prefix + raw.capitalize(),
+        prefix.capitalize() + '_' + raw.capitalize(),
+    ]
+    for cand in candidates:
+        if hasattr(enum_type, cand):
+            return getattr(enum_type, cand)
+    raise RuntimeError('unknown enum value %s for %s' % (name, enum_type))
+
+def safe_call(obj, method, value, label):
+    if hasattr(obj, method):
+        try:
+            getattr(obj, method)(value)
+            applied.append(label)
+            return True
+        except Exception as e:
+            warn('%s failed: %s' % (label, e))
+    return False
+
+def safe_set(obj, prop, value, label):
+    try:
+        obj.set_editor_property(prop, value)
+        applied.append(label)
+        return True
+    except Exception as e:
+        warn('%s failed: %s' % (label, e))
+        return False
+
+def children_of(widget):
+    try:
+        return [widget.get_child_at(i) for i in range(int(widget.get_children_count()))]
+    except Exception:
+        try:
+            return list(widget.get_all_children() or [])
+        except Exception:
+            return []
+
+def obj_name(obj):
+    try:
+        return obj.get_name()
+    except Exception:
+        return str(obj)
+
+def find_widget(tree, root, name):
+    if not name:
+        return root
+    try:
+        found = tree.find_widget(name)
+        if found is not None:
+            return found
+    except Exception:
+        pass
+    stack = [root]
+    while stack:
+        item = stack.pop(0)
+        if item is None:
+            continue
+        if obj_name(item) == name:
+            return item
+        stack.extend(children_of(item))
+    return None
+
+def class_for_widget(widget_type):
+    cls = getattr(unreal, widget_type, None)
+    if cls is not None:
+        return cls
+    if widget_type.startswith('/'):
+        for path in (widget_type, widget_type + '_C'):
+            try:
+                cls = unreal.load_object(None, path)
+                if cls is not None:
+                    return cls
+            except Exception:
+                pass
+    return None
+
+def widget_slot(widget):
+    try:
+        return widget.get_editor_property('slot')
+    except Exception:
+        return None
+
+def apply_properties(widget, props):
+    props = dict(props or {})
+    if 'text' in props:
+        safe_call(widget, 'set_text', unreal.Text(str(props['text'])), 'text')
+        if 'text' not in applied:
+            safe_set(widget, 'text', unreal.Text(str(props['text'])), 'text')
+    if 'tooltipText' in props:
+        safe_set(widget, 'tool_tip_text', unreal.Text(str(props['tooltipText'])), 'tooltipText')
+    if 'visibility' in props and hasattr(unreal, 'SlateVisibility'):
+        try:
+            safe_call(widget, 'set_visibility',
+                      enum_value(unreal.SlateVisibility, props['visibility'], ''),
+                      'visibility')
+        except Exception as e:
+            warn('visibility failed: %s' % e)
+    if 'isEnabled' in props:
+        safe_call(widget, 'set_is_enabled', bool(props['isEnabled']), 'isEnabled')
+        safe_set(widget, 'is_enabled', bool(props['isEnabled']), 'isEnabled')
+    if 'renderOpacity' in props:
+        safe_set(widget, 'render_opacity', float(props['renderOpacity']), 'renderOpacity')
+    if 'fontSize' in props:
+        try:
+            font = widget.get_editor_property('font')
+            font.set_editor_property('size', int(props['fontSize']))
+            if safe_call(widget, 'set_font', font, 'fontSize') is False:
+                safe_set(widget, 'font', font, 'fontSize')
+        except Exception as e:
+            warn('fontSize failed: %s' % e)
+    if 'color' in props:
+        c = props['color'] or {}
+        color = unreal.LinearColor(float(c.get('r', 1.0)), float(c.get('g', 1.0)),
+                                   float(c.get('b', 1.0)), float(c.get('a', 1.0)))
+        if not safe_call(widget, 'set_color_and_opacity', color, 'color'):
+            try:
+                safe_call(widget, 'set_color_and_opacity', unreal.SlateColor(color), 'color')
+            except Exception:
+                pass
+            safe_set(widget, 'color_and_opacity', color, 'color')
+    if 'brushColor' in props:
+        c = props['brushColor'] or {}
+        color = unreal.LinearColor(float(c.get('r', 1.0)), float(c.get('g', 1.0)),
+                                   float(c.get('b', 1.0)), float(c.get('a', 1.0)))
+        safe_call(widget, 'set_brush_color', color, 'brushColor')
+    if 'imagePath' in props:
+        asset = unreal.EditorAssetLibrary.load_asset(str(props['imagePath']))
+        if asset is None:
+            warn('imagePath could not be loaded: %s' % props['imagePath'])
+        elif hasattr(widget, 'set_brush_from_texture'):
+            safe_call(widget, 'set_brush_from_texture', asset, 'imagePath')
+        elif hasattr(widget, 'set_brush_resource_object'):
+            safe_call(widget, 'set_brush_resource_object', asset, 'imagePath')
+
+def apply_layout(slot, layout):
+    layout = dict(layout or {})
+    if slot is None:
+        warn('layout skipped: widget has no slot')
+        return
+    if 'position' in layout:
+        safe_call(slot, 'set_position', vec2(layout['position']), 'slot.position')
+    if 'size' in layout:
+        safe_call(slot, 'set_size', vec2(layout['size']), 'slot.size')
+    if 'anchors' in layout:
+        safe_call(slot, 'set_anchors', anchors(layout['anchors']), 'slot.anchors')
+    if 'alignment' in layout:
+        safe_call(slot, 'set_alignment', vec2(layout['alignment']), 'slot.alignment')
+    if 'offsets' in layout:
+        safe_call(slot, 'set_offsets', margin(layout['offsets']), 'slot.offsets')
+    if 'padding' in layout:
+        safe_call(slot, 'set_padding', margin(layout['padding']), 'slot.padding')
+    if 'autoSize' in layout:
+        safe_call(slot, 'set_auto_size', bool(layout['autoSize']), 'slot.autoSize')
+    if 'zOrder' in layout:
+        safe_call(slot, 'set_z_order', int(layout['zOrder']), 'slot.zOrder')
+    if 'horizontalAlignment' in layout and hasattr(unreal, 'HorizontalAlignment'):
+        try:
+            safe_call(slot, 'set_horizontal_alignment',
+                      enum_value(unreal.HorizontalAlignment, layout['horizontalAlignment'], 'HALIGN'),
+                      'slot.horizontalAlignment')
+        except Exception as e:
+            warn('horizontalAlignment failed: %s' % e)
+    if 'verticalAlignment' in layout and hasattr(unreal, 'VerticalAlignment'):
+        try:
+            safe_call(slot, 'set_vertical_alignment',
+                      enum_value(unreal.VerticalAlignment, layout['verticalAlignment'], 'VALIGN'),
+                      'slot.verticalAlignment')
+        except Exception as e:
+            warn('verticalAlignment failed: %s' % e)
+
+wbp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if wbp is None:
+    _emit({'ok': False, 'error': 'could not load widget blueprint'})
+else:
+    tree = wbp.get_editor_property('widget_tree')
+    root = tree.get_editor_property('root_widget') if tree else None
+    if tree is None or root is None:
+        _emit({'ok': False, 'error': 'widget blueprint has no root widget'})
+    else:
+        parent = find_widget(tree, root, _ARGS.get('parentName') or '')
+        if parent is None:
+            _emit({'ok': False, 'error': 'parent widget not found: %s' % (_ARGS.get('parentName') or '')})
+        else:
+            cls = class_for_widget(_ARGS['widgetType'])
+            if cls is None:
+                _emit({'ok': False, 'error': 'unknown widget type: %s' % _ARGS['widgetType']})
+            else:
+                child = tree.construct_widget(cls, _ARGS['widgetName'])
+                slot = None
+                added = False
+                if hasattr(parent, 'add_child'):
+                    try:
+                        slot = parent.add_child(child)
+                        added = True
+                    except Exception as e:
+                        warn('parent.add_child failed: %s' % e)
+                if not added and hasattr(parent, 'set_content'):
+                    try:
+                        parent.set_content(child)
+                        slot = widget_slot(child)
+                        added = True
+                    except Exception as e:
+                        warn('parent.set_content failed: %s' % e)
+                if not added:
+                    _emit({'ok': False, 'error': 'parent does not accept children/content: %s' % obj_name(parent), 'warnings': warnings})
+                else:
+                    props = dict(_ARGS.get('properties') or {})
+                    if _ARGS.get('text') is not None and 'text' not in props:
+                        props['text'] = _ARGS.get('text')
+                    apply_properties(child, props)
+                    apply_layout(slot or widget_slot(child), _ARGS.get('layout') or {})
+                    if hasattr(unreal, 'BlueprintEditorLibrary'):
+                        unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
+                    unreal.EditorAssetLibrary.save_asset(wbp.get_path_name())
+                    _emit({'ok': True, 'assetPath': wbp.get_path_name(),
+                           'widget': obj_name(child), 'type': _ARGS['widgetType'],
+                           'parent': obj_name(parent), 'added': added,
+                           'applied': applied, 'warnings': warnings})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() ||
+                arg_str(args, "widgetType").empty() ||
+                arg_str(args, "widgetName").empty())
+                return ToolResult::error("blueprintPath, widgetType and widgetName are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_set_widget_properties --------------------------------------------
+    add(Tool{
+        "ue_set_widget_properties",
+        "Set common UMG widget properties by widgetName: text, tooltipText, "
+        "visibility, isEnabled, renderOpacity, fontSize, color, brushColor, and "
+        "imagePath. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"widgetName", {{"type", "string"}, {"description", "empty means root widget"}}},
+               {"properties", {{"type", "object"}}}}},
+             {"required", json::array({"blueprintPath", "properties"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+applied = []
+warnings = []
+
+def warn(msg):
+    warnings.append(str(msg))
+
+def children_of(widget):
+    try:
+        return [widget.get_child_at(i) for i in range(int(widget.get_children_count()))]
+    except Exception:
+        try:
+            return list(widget.get_all_children() or [])
+        except Exception:
+            return []
+
+def obj_name(obj):
+    try:
+        return obj.get_name()
+    except Exception:
+        return str(obj)
+
+def find_widget(tree, root, name):
+    if not name:
+        return root
+    try:
+        found = tree.find_widget(name)
+        if found is not None:
+            return found
+    except Exception:
+        pass
+    stack = [root]
+    while stack:
+        item = stack.pop(0)
+        if item is None:
+            continue
+        if obj_name(item) == name:
+            return item
+        stack.extend(children_of(item))
+    return None
+
+def enum_value(enum_type, name):
+    raw = str(name or '').replace('-', '_').replace(' ', '_')
+    candidates = [raw, raw.upper(), raw.capitalize()]
+    for cand in candidates:
+        if hasattr(enum_type, cand):
+            return getattr(enum_type, cand)
+    raise RuntimeError('unknown enum value %s for %s' % (name, enum_type))
+
+def safe_call(obj, method, value, label):
+    if hasattr(obj, method):
+        try:
+            getattr(obj, method)(value)
+            applied.append(label)
+            return True
+        except Exception as e:
+            warn('%s failed: %s' % (label, e))
+    return False
+
+def safe_set(obj, prop, value, label):
+    try:
+        obj.set_editor_property(prop, value)
+        applied.append(label)
+        return True
+    except Exception as e:
+        warn('%s failed: %s' % (label, e))
+        return False
+
+def apply_properties(widget, props):
+    props = dict(props or {})
+    if 'text' in props:
+        if not safe_call(widget, 'set_text', unreal.Text(str(props['text'])), 'text'):
+            safe_set(widget, 'text', unreal.Text(str(props['text'])), 'text')
+    if 'tooltipText' in props:
+        safe_set(widget, 'tool_tip_text', unreal.Text(str(props['tooltipText'])), 'tooltipText')
+    if 'visibility' in props and hasattr(unreal, 'SlateVisibility'):
+        try:
+            safe_call(widget, 'set_visibility',
+                      enum_value(unreal.SlateVisibility, props['visibility']),
+                      'visibility')
+        except Exception as e:
+            warn('visibility failed: %s' % e)
+    if 'isEnabled' in props:
+        if not safe_call(widget, 'set_is_enabled', bool(props['isEnabled']), 'isEnabled'):
+            safe_set(widget, 'is_enabled', bool(props['isEnabled']), 'isEnabled')
+    if 'renderOpacity' in props:
+        safe_set(widget, 'render_opacity', float(props['renderOpacity']), 'renderOpacity')
+    if 'fontSize' in props:
+        try:
+            font = widget.get_editor_property('font')
+            font.set_editor_property('size', int(props['fontSize']))
+            if not safe_call(widget, 'set_font', font, 'fontSize'):
+                safe_set(widget, 'font', font, 'fontSize')
+        except Exception as e:
+            warn('fontSize failed: %s' % e)
+    if 'color' in props:
+        c = props['color'] or {}
+        color = unreal.LinearColor(float(c.get('r', 1.0)), float(c.get('g', 1.0)),
+                                   float(c.get('b', 1.0)), float(c.get('a', 1.0)))
+        if not safe_call(widget, 'set_color_and_opacity', color, 'color'):
+            try:
+                safe_call(widget, 'set_color_and_opacity', unreal.SlateColor(color), 'color')
+            except Exception:
+                pass
+            safe_set(widget, 'color_and_opacity', color, 'color')
+    if 'brushColor' in props:
+        c = props['brushColor'] or {}
+        color = unreal.LinearColor(float(c.get('r', 1.0)), float(c.get('g', 1.0)),
+                                   float(c.get('b', 1.0)), float(c.get('a', 1.0)))
+        safe_call(widget, 'set_brush_color', color, 'brushColor')
+    if 'imagePath' in props:
+        asset = unreal.EditorAssetLibrary.load_asset(str(props['imagePath']))
+        if asset is None:
+            warn('imagePath could not be loaded: %s' % props['imagePath'])
+        elif hasattr(widget, 'set_brush_from_texture'):
+            safe_call(widget, 'set_brush_from_texture', asset, 'imagePath')
+        elif hasattr(widget, 'set_brush_resource_object'):
+            safe_call(widget, 'set_brush_resource_object', asset, 'imagePath')
+
+wbp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if wbp is None:
+    _emit({'ok': False, 'error': 'could not load widget blueprint'})
+else:
+    tree = wbp.get_editor_property('widget_tree')
+    root = tree.get_editor_property('root_widget') if tree else None
+    widget = find_widget(tree, root, _ARGS.get('widgetName') or '') if root else None
+    if widget is None:
+        _emit({'ok': False, 'error': 'widget not found: %s' % (_ARGS.get('widgetName') or '<root>')})
+    else:
+        apply_properties(widget, _ARGS.get('properties') or {})
+        if hasattr(unreal, 'BlueprintEditorLibrary'):
+            unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
+        unreal.EditorAssetLibrary.save_asset(wbp.get_path_name())
+        _emit({'ok': True, 'assetPath': wbp.get_path_name(),
+               'widget': obj_name(widget), 'applied': applied, 'warnings': warnings})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() || !args.contains("properties"))
+                return ToolResult::error("blueprintPath and properties are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_configure_widget_layout ------------------------------------------
+    add(Tool{
+        "ue_configure_widget_layout",
+        "Configure a widget's UMG panel slot. Supports CanvasPanelSlot "
+        "position/size/anchors/alignment/offsets/autoSize/zOrder and common "
+        "panel-slot padding/horizontalAlignment/verticalAlignment. Python "
+        "recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"widgetName", {{"type", "string"}}},
+               {"layout", {{"type", "object"}}}}},
+             {"required", json::array({"blueprintPath", "widgetName", "layout"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+applied = []
+warnings = []
+
+def warn(msg):
+    warnings.append(str(msg))
+
+def vec2(src, default=(0.0, 0.0)):
+    src = src or {}
+    return unreal.Vector2D(float(src.get('x', default[0])),
+                           float(src.get('y', default[1])))
+
+def margin(src):
+    src = src or {}
+    return unreal.Margin(float(src.get('left', 0.0)),
+                         float(src.get('top', 0.0)),
+                         float(src.get('right', 0.0)),
+                         float(src.get('bottom', 0.0)))
+
+def anchors(src):
+    src = src or {}
+    mn = src.get('minimum') or src.get('min') or {}
+    mx = src.get('maximum') or src.get('max') or {}
+    minx = float(mn.get('x', src.get('minX', 0.0)))
+    miny = float(mn.get('y', src.get('minY', 0.0)))
+    maxx = float(mx.get('x', src.get('maxX', minx)))
+    maxy = float(mx.get('y', src.get('maxY', miny)))
+    try:
+        return unreal.Anchors(minimum=unreal.Vector2D(minx, miny),
+                              maximum=unreal.Vector2D(maxx, maxy))
+    except Exception:
+        return unreal.Anchors(minx, miny, maxx, maxy)
+
+def enum_value(enum_type, name, prefix):
+    raw = str(name or '').replace('-', '_').replace(' ', '_')
+    candidates = [raw, raw.upper(), prefix + raw.upper(), prefix + '_' + raw.upper()]
+    for cand in candidates:
+        if hasattr(enum_type, cand):
+            return getattr(enum_type, cand)
+    raise RuntimeError('unknown enum value %s for %s' % (name, enum_type))
+
+def safe_call(obj, method, value, label):
+    if hasattr(obj, method):
+        try:
+            getattr(obj, method)(value)
+            applied.append(label)
+            return True
+        except Exception as e:
+            warn('%s failed: %s' % (label, e))
+    return False
+
+def children_of(widget):
+    try:
+        return [widget.get_child_at(i) for i in range(int(widget.get_children_count()))]
+    except Exception:
+        try:
+            return list(widget.get_all_children() or [])
+        except Exception:
+            return []
+
+def obj_name(obj):
+    try:
+        return obj.get_name()
+    except Exception:
+        return str(obj)
+
+def find_widget(tree, root, name):
+    try:
+        found = tree.find_widget(name)
+        if found is not None:
+            return found
+    except Exception:
+        pass
+    stack = [root]
+    while stack:
+        item = stack.pop(0)
+        if item is None:
+            continue
+        if obj_name(item) == name:
+            return item
+        stack.extend(children_of(item))
+    return None
+
+def slot_for(widget):
+    try:
+        return widget.get_editor_property('slot')
+    except Exception:
+        return None
+
+def slot_type(slot):
+    try:
+        return slot.get_class().get_name()
+    except Exception:
+        return type(slot).__name__
+
+def apply_layout(slot, layout):
+    layout = dict(layout or {})
+    if slot is None:
+        raise RuntimeError('widget has no slot')
+    if 'position' in layout:
+        safe_call(slot, 'set_position', vec2(layout['position']), 'slot.position')
+    if 'size' in layout:
+        safe_call(slot, 'set_size', vec2(layout['size']), 'slot.size')
+    if 'anchors' in layout:
+        safe_call(slot, 'set_anchors', anchors(layout['anchors']), 'slot.anchors')
+    if 'alignment' in layout:
+        safe_call(slot, 'set_alignment', vec2(layout['alignment']), 'slot.alignment')
+    if 'offsets' in layout:
+        safe_call(slot, 'set_offsets', margin(layout['offsets']), 'slot.offsets')
+    if 'padding' in layout:
+        safe_call(slot, 'set_padding', margin(layout['padding']), 'slot.padding')
+    if 'autoSize' in layout:
+        safe_call(slot, 'set_auto_size', bool(layout['autoSize']), 'slot.autoSize')
+    if 'zOrder' in layout:
+        safe_call(slot, 'set_z_order', int(layout['zOrder']), 'slot.zOrder')
+    if 'horizontalAlignment' in layout and hasattr(unreal, 'HorizontalAlignment'):
+        try:
+            safe_call(slot, 'set_horizontal_alignment',
+                      enum_value(unreal.HorizontalAlignment, layout['horizontalAlignment'], 'HALIGN'),
+                      'slot.horizontalAlignment')
+        except Exception as e:
+            warn('horizontalAlignment failed: %s' % e)
+    if 'verticalAlignment' in layout and hasattr(unreal, 'VerticalAlignment'):
+        try:
+            safe_call(slot, 'set_vertical_alignment',
+                      enum_value(unreal.VerticalAlignment, layout['verticalAlignment'], 'VALIGN'),
+                      'slot.verticalAlignment')
+        except Exception as e:
+            warn('verticalAlignment failed: %s' % e)
+
+wbp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if wbp is None:
+    _emit({'ok': False, 'error': 'could not load widget blueprint'})
+else:
+    tree = wbp.get_editor_property('widget_tree')
+    root = tree.get_editor_property('root_widget') if tree else None
+    widget = find_widget(tree, root, _ARGS['widgetName']) if root else None
+    if widget is None:
+        _emit({'ok': False, 'error': 'widget not found: %s' % _ARGS['widgetName']})
+    else:
+        slot = slot_for(widget)
+        apply_layout(slot, _ARGS.get('layout') or {})
+        if hasattr(unreal, 'BlueprintEditorLibrary'):
+            unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
+        unreal.EditorAssetLibrary.save_asset(wbp.get_path_name())
+        _emit({'ok': True, 'assetPath': wbp.get_path_name(),
+               'widget': obj_name(widget), 'slotType': slot_type(slot),
+               'applied': applied, 'warnings': warnings})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() ||
+                arg_str(args, "widgetName").empty() || !args.contains("layout"))
+                return ToolResult::error("blueprintPath, widgetName and layout are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_create_widget_component_blueprint --------------------------------
+    add(Tool{
+        "ue_create_widget_component_blueprint",
+        "Create an Actor Blueprint with a WidgetComponent assigned to a UMG "
+        "Widget Blueprint class for world-space or screen-space UI. Configures "
+        "draw size, widget space, pivot, two-sided rendering, and draw-at-desired "
+        "size where available. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"name", {{"type", "string"}}},
+               {"packagePath", {{"type", "string"}}},
+               {"widgetBlueprintPath", {{"type", "string"}}},
+               {"componentName", {{"type", "string"}}},
+               {"space", {{"type", "string"}, {"description", "World or Screen"}}},
+               {"drawSize", {{"type", "object"}}},
+               {"pivot", {{"type", "object"}}},
+               {"drawAtDesiredSize", {{"type", "boolean"}}},
+               {"twoSided", {{"type", "boolean"}}},
+               {"reuseExisting", {{"type", "boolean"}}}}},
+             {"required", json::array({"name", "packagePath", "widgetBlueprintPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+name = _ARGS['name']
+pkg = _ARGS['packagePath'].rstrip('/')
+asset_path = pkg + '/' + name
+component_name = _ARGS.get('componentName') or 'Widget'
+warnings = []
+configured = []
+strategies = []
+
+def warn(msg):
+    warnings.append(str(msg))
+
+def vec2(src, default):
+    src = src or {}
+    return unreal.Vector2D(float(src.get('x', default[0])),
+                           float(src.get('y', default[1])))
+
+def bool_arg(key, default):
+    return bool(_ARGS.get(key, default))
+
+def safe_call(obj, method, value, label):
+    if hasattr(obj, method):
+        try:
+            getattr(obj, method)(value)
+            configured.append(label)
+            return True
+        except Exception as e:
+            warn('%s failed: %s' % (label, e))
+    return False
+
+def safe_set(obj, prop, value, label):
+    try:
+        obj.set_editor_property(prop, value)
+        configured.append(label)
+        return True
+    except Exception as e:
+        warn('%s failed: %s' % (label, e))
+        return False
+
+def generated_class(asset):
+    for prop in ('generated_class', 'skeleton_generated_class'):
+        try:
+            cls = asset.get_editor_property(prop)
+            if cls is not None:
+                return cls
+        except Exception:
+            pass
+    return None
+
+def compile_bp(bp):
+    if hasattr(unreal, 'BlueprintEditorLibrary'):
+        unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+
+def is_valid_handle(handle):
+    try:
+        return unreal.SubobjectDataBlueprintFunctionLibrary.is_handle_valid(handle)
+    except Exception:
+        return handle is not None
+
+def obj_from_handle(bp, handle):
+    bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+    data = bfl.get_data(handle)
+    try:
+        return bfl.get_object_for_blueprint(data, bp)
+    except Exception:
+        return bfl.get_object(data)
+
+def add_component(bp, parent_handle, comp_class, comp_name):
+    subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    params = unreal.AddNewSubobjectParams(parent_handle=parent_handle,
+                                          new_class=comp_class,
+                                          blueprint_context=bp,
+                                          skip_mark_blueprint_modified=False,
+                                          conform_transform_to_parent=False)
+    result = subsystem.add_new_subobject(params)
+    if isinstance(result, tuple):
+        handle = result[0]
+        fail_reason = result[1] if len(result) > 1 else ''
+    else:
+        handle = result
+        fail_reason = ''
+    if not is_valid_handle(handle):
+        raise RuntimeError('add_new_subobject(%s) returned invalid handle: %s' % (comp_name, fail_reason))
+    try:
+        subsystem.rename_subobject(handle, unreal.Text(comp_name))
+    except Exception:
+        try:
+            subsystem.rename_subobject(handle, comp_name)
+        except Exception as e:
+            strategies.append('rename %s failed: %s' % (comp_name, e))
+    return obj_from_handle(bp, handle)
+
+def enum_widget_space(name):
+    raw = str(name or 'World').lower()
+    if not hasattr(unreal, 'WidgetSpace'):
+        raise RuntimeError('WidgetSpace enum unavailable')
+    candidates = ['WORLD' if raw == 'world' else 'SCREEN',
+                  'E_WIDGET_SPACE_WORLD' if raw == 'world' else 'E_WIDGET_SPACE_SCREEN',
+                  'World' if raw == 'world' else 'Screen']
+    for cand in candidates:
+        if hasattr(unreal.WidgetSpace, cand):
+            return getattr(unreal.WidgetSpace, cand)
+    raise RuntimeError('unknown WidgetSpace value: %s' % name)
+
+widget_bp = unreal.EditorAssetLibrary.load_asset(_ARGS['widgetBlueprintPath'])
+if widget_bp is None:
+    raise RuntimeError('could not load widget blueprint: %s' % _ARGS['widgetBlueprintPath'])
+widget_cls = generated_class(widget_bp)
+if widget_cls is None:
+    raise RuntimeError('widget blueprint has no generated class: %s' % _ARGS['widgetBlueprintPath'])
+
+if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+    if not bool_arg('reuseExisting', False):
+        raise RuntimeError('asset already exists; pass reuseExisting=true to configure it: %s' % asset_path)
+    bp = unreal.EditorAssetLibrary.load_asset(asset_path)
+else:
+    factory = unreal.BlueprintFactory()
+    factory.set_editor_property('parent_class', unreal.Actor)
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+    bp = tools.create_asset(name, pkg, unreal.Blueprint, factory)
+    if bp is None:
+        raise RuntimeError('create_asset returned None: %s' % asset_path)
+
+compile_bp(bp)
+if not hasattr(unreal, 'SubobjectDataSubsystem') or not hasattr(unreal, 'AddNewSubobjectParams'):
+    _emit({'ok': False, 'unsupported': True,
+           'error': 'SubobjectDataSubsystem unavailable; cannot author WidgetComponent on this build',
+           'assetPath': bp.get_path_name(), 'componentAdded': False,
+           'strategiesTried': strategies})
+else:
+    subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    handles = list(subsystem.k2_gather_subobject_data_for_blueprint(bp))
+    parent = handles[0] if handles else None
+    if parent is None:
+        _emit({'ok': False, 'unsupported': True,
+               'error': 'could not find a parent subobject handle for Actor Blueprint',
+               'assetPath': bp.get_path_name(), 'componentAdded': False,
+               'strategiesTried': strategies})
+    else:
+        widget_comp = None
+        try:
+            widget_comp = add_component(bp, parent, unreal.WidgetComponent, component_name)
+            strategies.append('SubobjectDataSubsystem.add_new_subobject WidgetComponent OK')
+        except Exception as e:
+            _emit({'ok': False, 'unsupported': True,
+                   'error': 'WidgetComponent authoring failed: %s' % e,
+                   'assetPath': bp.get_path_name(), 'componentAdded': False,
+                   'strategiesTried': strategies})
+        if widget_comp is not None:
+            safe_call(widget_comp, 'set_widget_class', widget_cls, 'widgetClass')
+            safe_set(widget_comp, 'widget_class', widget_cls, 'widgetClass')
+            safe_call(widget_comp, 'set_draw_size', vec2(_ARGS.get('drawSize'), (500.0, 300.0)), 'drawSize')
+            safe_set(widget_comp, 'draw_size', vec2(_ARGS.get('drawSize'), (500.0, 300.0)), 'drawSize')
+            try:
+                safe_call(widget_comp, 'set_widget_space', enum_widget_space(_ARGS.get('space') or 'World'), 'space')
+                safe_set(widget_comp, 'space', enum_widget_space(_ARGS.get('space') or 'World'), 'space')
+            except Exception as e:
+                warn('space failed: %s' % e)
+            safe_set(widget_comp, 'pivot', vec2(_ARGS.get('pivot'), (0.5, 0.5)), 'pivot')
+            safe_call(widget_comp, 'set_draw_at_desired_size', bool_arg('drawAtDesiredSize', False), 'drawAtDesiredSize')
+            safe_set(widget_comp, 'draw_at_desired_size', bool_arg('drawAtDesiredSize', False), 'drawAtDesiredSize')
+            safe_set(widget_comp, 'two_sided', bool_arg('twoSided', True), 'twoSided')
+            compile_bp(bp)
+            unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+            _emit({'ok': True, 'assetPath': bp.get_path_name(),
+                   'widgetBlueprintPath': _ARGS['widgetBlueprintPath'],
+                   'componentName': component_name, 'componentAdded': True,
+                   'configured': configured, 'warnings': warnings,
+                   'strategiesTried': strategies})
+)PY";
+            if (arg_str(args, "name").empty() || arg_str(args, "packagePath").empty() ||
+                arg_str(args, "widgetBlueprintPath").empty())
+                return ToolResult::error("name, packagePath and widgetBlueprintPath are required");
+            ToolResult r = run_python_recipe(ctx, kRecipe, args);
+            if (r.is_error && r.payload.is_object() &&
+                r.payload.value("unsupported", false) == true) {
+                json extra = r.payload;
+                extra.erase("status");
+                extra.erase("error");
+                extra.erase("unsupported");
+                return ToolResult::unsupported(
+                    "WidgetComponent could not be authored via this engine's "
+                    "Python API; see strategiesTried.",
+                    std::move(extra));
+            }
+            return r;
         }});
 }
 
