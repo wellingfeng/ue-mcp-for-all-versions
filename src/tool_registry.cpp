@@ -379,6 +379,99 @@ ToolResult run_python_recipe(ToolContext& ctx, const std::string& body,
     return ToolResult::ok(std::move(result));
 }
 
+// Shared validation preamble for the asset-import tools. It defines
+// _validate_import_source(), which enforces path/name/content constraints
+// BEFORE any UE import runs, so a wrong or stale file is rejected early
+// instead of being silently imported. On any violation it emits an error
+// result and returns None; on success it returns a dict carrying the
+// resolved path plus identity fields (name, sha1, size, mtime) so callers
+// can prove they imported the file they intended. Constraints:
+//   * sourceFile must be an absolute path to an existing file
+//   * extension must be in the allowed list (overridable via allowedExtensions)
+//   * if allowedRootDirs is given, the file must live under one of them
+//   * if expectedSha1 / expectedSizeBytes are given, they must match
+constexpr const char* kImportValidationPreamble = R"PY(
+import os, hashlib
+
+def _validate_import_source():
+    src = _ARGS.get('sourceFile') or ''
+    DEFAULT_EXTS = ['.fbx', '.obj', '.glb', '.gltf', '.abc', '.dae', '.stl',
+                    '.ply', '.usd', '.usda', '.usdc', '.usdz', '.png', '.jpg',
+                    '.jpeg', '.tga', '.bmp', '.exr', '.hdr', '.psd', '.tif',
+                    '.tiff', '.dds', '.wav']
+    raw_exts = _ARGS.get('allowedExtensions') or DEFAULT_EXTS
+    allowed_exts = [e.lower() if e.startswith('.') else '.' + e.lower()
+                    for e in raw_exts]
+    allowed_roots = _ARGS.get('allowedRootDirs') or []
+
+    def _fail(msg, **extra):
+        d = {'ok': False, 'error': msg, 'sourceFile': src}
+        d.update(extra)
+        _emit(d)
+
+    if not src:
+        _fail('sourceFile is required')
+        return None
+    norm = os.path.normpath(src)
+    if not os.path.isabs(norm):
+        _fail('sourceFile must be an absolute path')
+        return None
+    if not os.path.isfile(norm):
+        _fail('sourceFile does not exist or is not a regular file')
+        return None
+    ext = os.path.splitext(norm)[1].lower()
+    if ext not in allowed_exts:
+        _fail('file extension %r is not in the allowed list' % ext,
+              allowedExtensions=allowed_exts)
+        return None
+    if allowed_roots:
+        real = os.path.realpath(norm)
+        ok_root = False
+        matched = None
+        for root in allowed_roots:
+            try:
+                rr = os.path.realpath(root)
+                if os.path.commonpath([real, rr]) == rr:
+                    ok_root = True
+                    matched = root
+                    break
+            except Exception:
+                pass
+        if not ok_root:
+            _fail('sourceFile is not under any of allowedRootDirs',
+                  allowedRootDirs=allowed_roots)
+            return None
+    h = hashlib.sha1()
+    with open(norm, 'rb') as f:
+        for chunk in iter(lambda: f.read(1048576), b''):
+            h.update(chunk)
+    sha1 = h.hexdigest()
+    size = os.path.getsize(norm)
+    exp_sha = _ARGS.get('expectedSha1')
+    exp_size = _ARGS.get('expectedSizeBytes')
+    if exp_sha and str(exp_sha).lower() != sha1.lower():
+        _fail('sha1 mismatch: file content differs from expectedSha1',
+              expectedSha1=str(exp_sha).lower(), actualSha1=sha1)
+        return None
+    if exp_size is not None and int(exp_size) != int(size):
+        _fail('size mismatch: file size differs from expectedSizeBytes',
+              expectedSizeBytes=int(exp_size), actualSizeBytes=int(size))
+        return None
+    return {'sourceFile': src, 'resolvedPath': norm,
+            'sourceFileName': os.path.basename(norm),
+            'sourceFileSha1': sha1, 'sourceFileSizeBytes': int(size),
+            'sourceFileMtime': os.path.getmtime(norm)}
+
+def _validate_destination():
+    dst = _ARGS.get('destinationPath') or ''
+    if not dst.startswith('/'):
+        _emit({'ok': False,
+               'error': 'destinationPath must be a content path starting with "/" (e.g. /Game/Imported)',
+               'destinationPath': dst})
+        return None
+    return dst
+)PY";
+
 }  // namespace
 
 void ToolRegistry::register_builtins() {
@@ -3612,28 +3705,60 @@ else:
         "ue_import_asset",
         "Import a source file (FBX, OBJ, PNG, etc.) into the project. Pass "
         "sourceFile (an absolute path on the machine running the editor) and "
-        "destinationPath (a content folder, e.g. \"/Game/Imported\"). Returns the "
-        "imported asset path(s). Python recipe using AssetImportTask; requires "
-        "PythonScriptPlugin.",
+        "destinationPath (a content folder, e.g. \"/Game/Imported\"). The "
+        "source file is validated before import: it must be an absolute path "
+        "to an existing file with an allowed extension, and (optionally) live "
+        "under allowedRootDirs and match expectedSha1/expectedSizeBytes. This "
+        "guards against importing a wrong or stale cached file. Returns the "
+        "imported asset path(s) plus the source file's name/sha1/size so the "
+        "caller can confirm it imported the intended file. Python recipe using "
+        "AssetImportTask; requires PythonScriptPlugin.",
         json{{"type", "object"},
              {"properties",
               {{"sourceFile", {{"type", "string"}}},
-               {"destinationPath", {{"type", "string"}}}}},
+               {"destinationPath", {{"type", "string"}}},
+               {"allowedExtensions",
+                {{"type", "array"},
+                 {"items", {{"type", "string"}}},
+                 {"description", "Override the default allowed extension list, "
+                                 "e.g. [\".fbx\", \".glb\"]."}}},
+               {"allowedRootDirs",
+                {{"type", "array"},
+                 {"items", {{"type", "string"}}},
+                 {"description", "If set, sourceFile must reside under one of "
+                                 "these directories (blocks stale cache dirs)."}}},
+               {"expectedSha1",
+                {{"type", "string"},
+                 {"description", "If set, the file's SHA1 must match exactly."}}},
+               {"expectedSizeBytes",
+                {{"type", "integer"},
+                 {"description", "If set, the file's byte size must match."}}}}},
              {"required", json::array({"sourceFile", "destinationPath"})}},
         {Capability::PythonScripting},
         [](ToolContext& ctx, const json& args) -> ToolResult {
-            static const char* kRecipe = R"PY(
-src = _ARGS['sourceFile']
-dst = _ARGS['destinationPath']
-task = unreal.AssetImportTask()
-task.set_editor_property('filename', src)
-task.set_editor_property('destination_path', dst)
-task.set_editor_property('automated', True)
-task.set_editor_property('save', True)
-task.set_editor_property('replace_existing', True)
-unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
-imported = list(task.get_editor_property('imported_object_paths') or [])
-_emit({'ok': len(imported) > 0, 'error': '' if imported else 'no objects imported (check source path/format)', 'imported': imported})
+            static const std::string kRecipe = std::string(kImportValidationPreamble) + R"PY(
+def _do_import(_v, dst):
+    src = _v['resolvedPath']
+    task = unreal.AssetImportTask()
+    task.set_editor_property('filename', src)
+    task.set_editor_property('destination_path', dst)
+    task.set_editor_property('automated', True)
+    task.set_editor_property('save', True)
+    task.set_editor_property('replace_existing', True)
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    imported = list(task.get_editor_property('imported_object_paths') or [])
+    _emit({'ok': len(imported) > 0,
+           'error': '' if imported else 'no objects imported (check source path/format)',
+           'imported': imported,
+           'sourceFileName': _v['sourceFileName'],
+           'sourceFileSha1': _v['sourceFileSha1'],
+           'sourceFileSizeBytes': _v['sourceFileSizeBytes']})
+
+_v = _validate_import_source()
+if _v is not None:
+    _dst = _validate_destination()
+    if _dst is not None:
+        _do_import(_v, _dst)
 )PY";
             if (arg_str(args, "sourceFile").empty() || arg_str(args, "destinationPath").empty())
                 return ToolResult::error("sourceFile and destinationPath are required");
@@ -3647,8 +3772,12 @@ _emit({'ok': len(imported) > 0, 'error': '' if imported else 'no objects importe
         "transform policy options such as convertScene, forceFrontXAxis, "
         "convertSceneUnit, importUniformScale, importAsSkeletal, and nested "
         "skeletalMeshImportData/staticMeshImportData overrides where the engine "
-        "Python API exposes them. Python recipe using AssetImportTask; requires "
-        "PythonScriptPlugin.",
+        "Python API exposes them. The source file is validated before import "
+        "(absolute path, existing file, allowed extension, optional "
+        "allowedRootDirs / expectedSha1 / expectedSizeBytes) so a wrong or "
+        "stale cached file is rejected early. Returns the source file's "
+        "name/sha1/size alongside the imported paths. Python recipe using "
+        "AssetImportTask; requires PythonScriptPlugin.",
         json{{"type", "object"},
              {"properties",
               {{"sourceFile", {{"type", "string"}}},
@@ -3662,16 +3791,18 @@ _emit({'ok': len(imported) > 0, 'error': '' if imported else 'no objects importe
                {"forceFrontXAxis", {{"type", "boolean"}}},
                {"convertSceneUnit", {{"type", "boolean"}}},
                {"importUniformScale", {{"type", "number"}}},
+               {"allowedExtensions",
+                {{"type", "array"}, {"items", {{"type", "string"}}}}},
+               {"allowedRootDirs",
+                {{"type", "array"}, {"items", {{"type", "string"}}}}},
+               {"expectedSha1", {{"type", "string"}}},
+               {"expectedSizeBytes", {{"type", "integer"}}},
                {"skeletalMeshImportData", {{"type", "object"}}},
                 {"staticMeshImportData", {{"type", "object"}}}}},
              {"required", json::array({"sourceFile", "destinationPath"})}},
         {Capability::PythonScripting},
         [](ToolContext& ctx, const json& args) -> ToolResult {
-            static const char* kRecipe = R"PY(
-src = _ARGS['sourceFile']
-dst = _ARGS['destinationPath']
-replace = bool(_ARGS.get('replaceExisting', True))
-save = bool(_ARGS.get('save', True))
+            static const std::string kRecipe = std::string(kImportValidationPreamble) + R"PY(
 warnings = []
 applied = {}
 failed = {}
@@ -3721,73 +3852,86 @@ def apply_import_data(data, prefix, extra):
         if not set_prop(data, prop, value, '%s.%s' % (prefix, prop)):
             set_prop(data, str(key), value, '%s.%s' % (prefix, key))
 
-task = unreal.AssetImportTask()
-set_prop(task, 'filename', src)
-set_prop(task, 'destination_path', dst)
-set_prop(task, 'automated', True)
-set_prop(task, 'save', save)
-set_prop(task, 'replace_existing', replace)
+def _run(_v, dst):
+    src = _v['resolvedPath']
+    replace = bool(_ARGS.get('replaceExisting', True))
+    save = bool(_ARGS.get('save', True))
+    task = unreal.AssetImportTask()
+    set_prop(task, 'filename', src)
+    set_prop(task, 'destination_path', dst)
+    set_prop(task, 'automated', True)
+    set_prop(task, 'save', save)
+    set_prop(task, 'replace_existing', replace)
 
-lower = src.lower()
-options = None
-if lower.endswith('.fbx') and hasattr(unreal, 'FbxImportUI'):
-    options = unreal.FbxImportUI()
-    set_prop(options, 'automated_import_should_detect_type', not bool(_ARGS.get('importAsSkeletal', False)),
-             'fbx.automated_import_should_detect_type')
-    if 'importAsSkeletal' in _ARGS:
-        skeletal = bool(_ARGS.get('importAsSkeletal'))
-        set_prop(options, 'import_as_skeletal', skeletal, 'fbx.import_as_skeletal')
-        enum = getattr(unreal, 'FBXImportType', None)
-        if enum is not None:
-            if skeletal and hasattr(enum, 'FBXIT_SKELETAL_MESH'):
-                set_prop(options, 'mesh_type_to_import', enum.FBXIT_SKELETAL_MESH, 'fbx.mesh_type_to_import')
-            elif (not skeletal) and hasattr(enum, 'FBXIT_STATIC_MESH'):
-                set_prop(options, 'mesh_type_to_import', enum.FBXIT_STATIC_MESH, 'fbx.mesh_type_to_import')
-    if 'importMaterials' in _ARGS:
-        set_prop(options, 'import_materials', bool(_ARGS.get('importMaterials')), 'fbx.import_materials')
-    if 'importTextures' in _ARGS:
-        set_prop(options, 'import_textures', bool(_ARGS.get('importTextures')), 'fbx.import_textures')
-    apply_import_data(get_prop(options, 'static_mesh_import_data'), 'staticMeshImportData',
-                      _ARGS.get('staticMeshImportData') or {})
-    apply_import_data(get_prop(options, 'skeletal_mesh_import_data'), 'skeletalMeshImportData',
-                      _ARGS.get('skeletalMeshImportData') or {})
-elif lower.endswith('.glb') or lower.endswith('.gltf'):
-    # GLTF importer option class names have changed across engine/plugin
-    # versions. Try the known names and set matching properties when present.
-    opt_cls = None
-    for cls_name in ('GLTFImportOptions', 'GltfImportOptions', 'GLTFImportSettings'):
-        opt_cls = getattr(unreal, cls_name, None)
+    lower = src.lower()
+    options = None
+    if lower.endswith('.fbx') and hasattr(unreal, 'FbxImportUI'):
+        options = unreal.FbxImportUI()
+        set_prop(options, 'automated_import_should_detect_type', not bool(_ARGS.get('importAsSkeletal', False)),
+                 'fbx.automated_import_should_detect_type')
+        if 'importAsSkeletal' in _ARGS:
+            skeletal = bool(_ARGS.get('importAsSkeletal'))
+            set_prop(options, 'import_as_skeletal', skeletal, 'fbx.import_as_skeletal')
+            enum = getattr(unreal, 'FBXImportType', None)
+            if enum is not None:
+                if skeletal and hasattr(enum, 'FBXIT_SKELETAL_MESH'):
+                    set_prop(options, 'mesh_type_to_import', enum.FBXIT_SKELETAL_MESH, 'fbx.mesh_type_to_import')
+                elif (not skeletal) and hasattr(enum, 'FBXIT_STATIC_MESH'):
+                    set_prop(options, 'mesh_type_to_import', enum.FBXIT_STATIC_MESH, 'fbx.mesh_type_to_import')
+        if 'importMaterials' in _ARGS:
+            set_prop(options, 'import_materials', bool(_ARGS.get('importMaterials')), 'fbx.import_materials')
+        if 'importTextures' in _ARGS:
+            set_prop(options, 'import_textures', bool(_ARGS.get('importTextures')), 'fbx.import_textures')
+        apply_import_data(get_prop(options, 'static_mesh_import_data'), 'staticMeshImportData',
+                          _ARGS.get('staticMeshImportData') or {})
+        apply_import_data(get_prop(options, 'skeletal_mesh_import_data'), 'skeletalMeshImportData',
+                          _ARGS.get('skeletalMeshImportData') or {})
+    elif lower.endswith('.glb') or lower.endswith('.gltf'):
+        # GLTF importer option class names have changed across engine/plugin
+        # versions. Try the known names and set matching properties when present.
+        opt_cls = None
+        for cls_name in ('GLTFImportOptions', 'GltfImportOptions', 'GLTFImportSettings'):
+            opt_cls = getattr(unreal, cls_name, None)
+            if opt_cls is not None:
+                break
         if opt_cls is not None:
-            break
-    if opt_cls is not None:
-        try:
-            options = opt_cls()
-            for arg_key, prop in (('importUniformScale', 'import_uniform_scale'),
-                                  ('convertScene', 'convert_scene'),
-                                  ('forceFrontXAxis', 'force_front_x_axis'),
-                                  ('convertSceneUnit', 'convert_scene_unit')):
-                if arg_key in _ARGS:
-                    set_prop(options, prop, _ARGS[arg_key], 'gltf.%s' % prop)
-        except Exception as e:
-            warnings.append('could not create GLTF import options: %s' % e)
+            try:
+                options = opt_cls()
+                for arg_key, prop in (('importUniformScale', 'import_uniform_scale'),
+                                      ('convertScene', 'convert_scene'),
+                                      ('forceFrontXAxis', 'force_front_x_axis'),
+                                      ('convertSceneUnit', 'convert_scene_unit')):
+                    if arg_key in _ARGS:
+                        set_prop(options, prop, _ARGS[arg_key], 'gltf.%s' % prop)
+            except Exception as e:
+                warnings.append('could not create GLTF import options: %s' % e)
+        else:
+            warnings.append('GLTF import options class not exposed; task will use plugin defaults')
     else:
-        warnings.append('GLTF import options class not exposed; task will use plugin defaults')
-else:
-    warnings.append('no specialized transform import UI for this extension; task will use factory defaults')
+        warnings.append('no specialized transform import UI for this extension; task will use factory defaults')
 
-if options is not None:
-    set_prop(task, 'options', options, 'task.options')
+    if options is not None:
+        set_prop(task, 'options', options, 'task.options')
 
-unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
-imported = list(task.get_editor_property('imported_object_paths') or [])
-_emit({'ok': len(imported) > 0,
-       'error': '' if imported else 'no objects imported (check source path/format/import plugin)',
-       'sourceFile': src,
-       'destinationPath': dst,
-       'imported': imported,
-       'appliedOptions': applied,
-       'failedOptions': failed,
-       'warnings': warnings})
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    imported = list(task.get_editor_property('imported_object_paths') or [])
+    _emit({'ok': len(imported) > 0,
+           'error': '' if imported else 'no objects imported (check source path/format/import plugin)',
+           'sourceFile': src,
+           'destinationPath': dst,
+           'imported': imported,
+           'sourceFileName': _v['sourceFileName'],
+           'sourceFileSha1': _v['sourceFileSha1'],
+           'sourceFileSizeBytes': _v['sourceFileSizeBytes'],
+           'appliedOptions': applied,
+           'failedOptions': failed,
+           'warnings': warnings})
+
+_v = _validate_import_source()
+if _v is not None:
+    _dst = _validate_destination()
+    if _dst is not None:
+        _run(_v, _dst)
 )PY";
             if (arg_str(args, "sourceFile").empty() || arg_str(args, "destinationPath").empty())
                 return ToolResult::error("sourceFile and destinationPath are required");
