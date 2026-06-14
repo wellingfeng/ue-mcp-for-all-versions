@@ -153,7 +153,7 @@ You can start the CLI before the editor — the server connects lazily (see
 
 ## Tools
 
-104 tools, grouped below. Every tool is **capability-gated**: if the connected
+110 tools, grouped below. Every tool is **capability-gated**: if the connected
 engine lacks the required capability it returns
 `{"status":"unsupported", "reason": ..., "missingCapability": ...}` instead of
 failing. Tools marked *modern→legacy* call the UE5 editor subsystem first and
@@ -355,6 +355,60 @@ helpers. If configuring manually, enable `RemoteControl`,
 `EditorScriptingUtilities`, and `PythonScriptPlugin`. For Python tools on
 UE 5.x, setup also enables RemoteControl's remote Python execution project
 setting by default.
+
+### Pencil → UMG conversion (Layer 3 plugin)
+
+When the user wants to turn a Pencil design (`.pen`) into a UMG widget, these
+three tools wrap the external
+[Pencil2UMG](https://github.com/wellingfeng/pencil2umg) editor plugin. The
+plugin ships as a prebuilt editor module in GitHub Releases and exposes
+`UPencil2UMGImporterLibrary::ImportPenFile`, which these tools drive from a UE
+Python recipe (the GitHub query, download, unzip, and import all run inside the
+editor, which has TLS + filesystem access). The install is **confirm-gated and
+self-updating**: the user confirms once for the first install and again for any
+later release, and "latest" always means the newest GitHub release at call time.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_pencil2umg_status` | python | Report installed version, the latest GitHub release, whether an update is available, and whether the importer is loaded |
+| `ue_pencil2umg_install` | python | Confirm-gated download/install of the latest release into `Plugins/Pencil2UMG` and enable it in the `.uproject`. `confirm=false` returns a `needsConfirmation` preview (fresh install vs. from→to update); `confirm=true` performs it; restart the editor afterward |
+| `ue_pencil_to_umg` | python | Convert a `.pen` file to a UMG Widget Blueprint via the installed importer; returns `needsInstall` / `needsRestart` when the plugin isn't ready |
+
+Typical flow: `ue_pencil2umg_status` → if not installed or an update exists, ask
+the user, then `ue_pencil2umg_install(confirm=true)` → restart the editor →
+`ue_pencil_to_umg(penFilePath=..., packagePath="/Game/UI")`. The install never
+writes anything without an explicit `confirm=true`, so the agent can safely
+preview the action first.
+
+### Figma → UMG conversion (Layer 3 plugin)
+
+When the user wants to import a Figma design into UMG, these three tools wrap
+the external [Figma2UMG](https://github.com/wellingfeng/figma2umg) editor plugin
+(Buvi Games, MIT). It differs from Pencil2UMG in important ways, and the tools
+are honest about them:
+
+- **No tagged releases.** Figma2UMG is a C++ *source* plugin with no prebuilt
+  binaries, so "latest" is tracked by the main-branch HEAD commit SHA (recorded
+  in a `.figma2umg_version` marker), and install pulls the source zipball.
+- **Compile step.** After install/update the editor must restart and *compile*
+  the module (a C++ toolchain is required) before the importer is usable.
+- **No scriptable import.** Its importer subsystem has no BlueprintCallable
+  entry point, so the conversion can't be triggered from Python. `ue_figma_to_umg`
+  instead pre-fills the Figma token / file key / import path settings and
+  returns a `manualStep` payload telling the user to launch the import from the
+  Content Browser context menu — the only supported trigger.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_figma2umg_status` | python | Report installed version + source commit, the latest main-branch commit, whether an update is available, and whether the module is compiled/loaded |
+| `ue_figma2umg_install` | python | Confirm-gated download/install of the latest source commit into `Plugins/Figma2UMG` and enable it in the `.uproject`. `confirm=false` previews (fresh install vs. from→to commit update); `confirm=true` performs it; restart + recompile the editor afterward |
+| `ue_figma_to_umg` | python | Pre-fill the Figma access token / file key / content path in the project settings, then return a `manualStep` payload guiding the Content-Browser import; returns `needsInstall` / `needsCompile` when the plugin isn't ready |
+
+Typical flow: `ue_figma2umg_status` → if not installed or an update exists, ask
+the user, then `ue_figma2umg_install(confirm=true)` → restart the editor and let
+it compile → `ue_figma_to_umg(accessToken=..., fileKey=..., contentRootFolder="/Game/Figma")`
+→ launch the import from the Content Browser as instructed. As with Pencil2UMG,
+the install never writes anything without an explicit `confirm=true`.
 
 A tool whose capability is absent on the connected engine returns
 `{"status":"unsupported", "reason": ..., "missingCapability": ...}` — never a

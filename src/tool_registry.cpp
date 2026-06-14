@@ -560,6 +560,8 @@ void ToolRegistry::register_builtins() {
     register_creation_tools();
     register_data_debug_tools();
     register_authoring_tools();
+    register_pencil2umg_tools();
+    register_figma2umg_tools();
 }
 
 // ---------------------------------------------------------------------------
@@ -6688,4 +6690,588 @@ else:
         }});
 }
 
+// ---------------------------------------------------------------------------
+// Pencil -> UMG conversion via the external Pencil2UMG editor plugin
+// (https://github.com/wellingfeng/pencil2umg).
+//
+// The plugin ships as a prebuilt editor module in GitHub Releases and exposes
+// UPencil2UMGImporterLibrary::ImportPenFile(PenFilePath, PackagePath) as a
+// BlueprintCallable, so once it is installed and the editor has loaded it we
+// can drive the conversion from a UE Python recipe.
+//
+// Lifecycle implemented here (all inside UE's editor Python, which has TLS +
+// filesystem access the standalone C++ httplib lacks):
+//   1. ue_pencil2umg_status  — report installed vs. latest GitHub release.
+//   2. ue_pencil2umg_install — confirm-gated: query the LATEST release on
+//      GitHub, and only when called with confirm=true download that release's
+//      .zip asset and extract it into <Project>/Plugins/Pencil2UMG, then enable
+//      it in the .uproject. A fresh install and every later update each require
+//      one explicit confirmation (confirm=true); without it the tool returns a
+//      non-error needsConfirmation payload describing what would happen.
+//   3. ue_pencil_to_umg      — the actual conversion. If the importer is not
+//      loaded it returns an actionable needsInstall / needsRestart payload so
+//      the agent can route to the install tool (and then ask the editor to be
+//      restarted) before retrying.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_pencil2umg_tools() {
+    // -- ue_pencil2umg_status -------------------------------------------------
+    add(Tool{
+        "ue_pencil2umg_status",
+        "Report the Pencil2UMG plugin state for Pencil (.pen) -> UMG conversion: "
+        "the version installed in this project's Plugins folder (if any), the "
+        "latest version published in the GitHub releases of "
+        "wellingfeng/pencil2umg, whether an update is available, and whether the "
+        "importer class is currently loaded by the editor. Call this when the "
+        "user wants to turn a Pencil design into a UMG widget, to decide whether "
+        "ue_pencil2umg_install is needed. Optional repo (owner/name) overrides "
+        "the default. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"repo", {{"type", "string"},
+                         {"description", "owner/name, default wellingfeng/pencil2umg"}}}}}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+import urllib.request, json as _json, os
+repo = _ARGS.get('repo') or 'wellingfeng/pencil2umg'
+plugins_dir = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_plugins_dir())
+plugin_dir = os.path.join(plugins_dir, 'Pencil2UMG')
+uplugin = os.path.join(plugin_dir, 'Pencil2UMG.uplugin')
+installed_version = None
+if os.path.isfile(uplugin):
+    try:
+        with open(uplugin, 'r', encoding='utf-8') as f:
+            installed_version = _json.load(f).get('VersionName')
+    except Exception:
+        installed_version = '(unreadable)'
+latest_version = None
+asset_name = None
+asset_url = None
+asset_size = None
+net_error = None
+try:
+    req = urllib.request.Request('https://api.github.com/repos/%s/releases/latest' % repo,
+                                 headers={'User-Agent': 'ue-mcp-for-all-versions',
+                                          'Accept': 'application/vnd.github+json'})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        rel = _json.loads(resp.read().decode('utf-8'))
+    latest_version = (rel.get('tag_name') or '').lstrip('vV') or rel.get('name')
+    for a in rel.get('assets', []):
+        if (a.get('name') or '').lower().endswith('.zip'):
+            asset_name = a.get('name'); asset_url = a.get('browser_download_url'); asset_size = a.get('size')
+            break
+except Exception as e:
+    net_error = str(e)
+def _norm(v):
+    return (v or '').lstrip('vV')
+importer_loaded = hasattr(unreal, 'Pencil2UMGImporterLibrary')
+update_available = bool(latest_version and _norm(installed_version) != _norm(latest_version))
+_emit({'ok': True,
+       'repo': repo,
+       'installed': installed_version is not None,
+       'installedVersion': installed_version,
+       'latestVersion': latest_version,
+       'assetName': asset_name,
+       'assetUrl': asset_url,
+       'assetSizeBytes': asset_size,
+       'updateAvailable': update_available,
+       'importerLoaded': importer_loaded,
+       'restartRequiredToLoad': bool(installed_version is not None and not importer_loaded),
+       'pluginDir': plugin_dir,
+       'netError': net_error})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_pencil2umg_install ------------------------------------------------
+    add(Tool{
+        "ue_pencil2umg_install",
+        "Download and install (or update to) the LATEST Pencil2UMG release from "
+        "GitHub (wellingfeng/pencil2umg) into this project's "
+        "Plugins/Pencil2UMG folder, then enable it in the .uproject. This is "
+        "CONFIRM-GATED: call with confirm=false (or omit it) first to get a "
+        "needsConfirmation payload describing the exact action (fresh install or "
+        "the from->to version update); only call with confirm=true after the user "
+        "has explicitly agreed. The user must confirm once for the initial "
+        "install and again for any later update. 'Latest' always means the "
+        "current newest GitHub release at call time, not a version pinned in this "
+        "server. Set force=true to reinstall even when already up to date. After "
+        "a successful install or update the Unreal Editor must be RESTARTED so it "
+        "loads the new editor module before ue_pencil_to_umg can run. Python "
+        "recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"confirm", {{"type", "boolean"},
+                            {"description", "must be true to actually download/install"}}},
+               {"force", {{"type", "boolean"},
+                          {"description", "reinstall even if already on the latest version"}}},
+               {"repo", {{"type", "string"},
+                         {"description", "owner/name, default wellingfeng/pencil2umg"}}}}}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+import urllib.request, json as _json, os, zipfile, tempfile, shutil
+repo = _ARGS.get('repo') or 'wellingfeng/pencil2umg'
+confirm = bool(_ARGS.get('confirm'))
+force = bool(_ARGS.get('force'))
+plugins_dir = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_plugins_dir())
+plugin_dir = os.path.join(plugins_dir, 'Pencil2UMG')
+uplugin = os.path.join(plugin_dir, 'Pencil2UMG.uplugin')
+def _norm(v):
+    return (v or '').lstrip('vV')
+installed_version = None
+if os.path.isfile(uplugin):
+    try:
+        with open(uplugin, 'r', encoding='utf-8') as f:
+            installed_version = _json.load(f).get('VersionName')
+    except Exception:
+        installed_version = '(unreadable)'
+req = urllib.request.Request('https://api.github.com/repos/%s/releases/latest' % repo,
+                             headers={'User-Agent': 'ue-mcp-for-all-versions',
+                                      'Accept': 'application/vnd.github+json'})
+with urllib.request.urlopen(req, timeout=20) as resp:
+    rel = _json.loads(resp.read().decode('utf-8'))
+latest_version = (rel.get('tag_name') or '').lstrip('vV') or rel.get('name')
+asset_url = None; asset_name = None; asset_size = None
+for a in rel.get('assets', []):
+    if (a.get('name') or '').lower().endswith('.zip'):
+        asset_url = a.get('browser_download_url'); asset_name = a.get('name'); asset_size = a.get('size')
+        break
+if not asset_url:
+    _emit({'ok': False, 'error': 'latest release %s has no .zip asset to install' % latest_version})
+else:
+    is_update = installed_version is not None
+    up_to_date = is_update and _norm(installed_version) == _norm(latest_version)
+    action = 'reinstall' if (up_to_date and force) else ('update' if is_update else 'install')
+    if up_to_date and not force:
+        _emit({'ok': True, 'action': 'none', 'installedVersion': installed_version,
+               'latestVersion': latest_version,
+               'message': 'Pencil2UMG is already on the latest version; pass force=true to reinstall.'})
+    elif not confirm:
+        _emit({'ok': True, 'needsConfirmation': True, 'action': action,
+               'installedVersion': installed_version, 'latestVersion': latest_version,
+               'assetName': asset_name, 'assetSizeBytes': asset_size, 'pluginDir': plugin_dir,
+               'message': ('A new Pencil2UMG version (%s) is available; updating from %s. '
+                           'Confirm to download and install.' % (latest_version, installed_version))
+                          if is_update else
+                          ('Pencil2UMG %s will be downloaded from GitHub and installed into the '
+                           'project Plugins folder. Confirm to proceed.' % latest_version)})
+    else:
+        tmpdir = tempfile.mkdtemp(prefix='pencil2umg_')
+        zpath = os.path.join(tmpdir, asset_name or 'pencil2umg.zip')
+        dreq = urllib.request.Request(asset_url, headers={'User-Agent': 'ue-mcp-for-all-versions'})
+        with urllib.request.urlopen(dreq, timeout=120) as resp, open(zpath, 'wb') as out:
+            shutil.copyfileobj(resp, out)
+        extract_root = os.path.join(tmpdir, 'extract')
+        with zipfile.ZipFile(zpath) as zf:
+            zf.extractall(extract_root)
+        src_plugin = None
+        for root, _dirs, files in os.walk(extract_root):
+            if 'Pencil2UMG.uplugin' in files:
+                src_plugin = root; break
+        if src_plugin is None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            _emit({'ok': False, 'error': 'downloaded archive did not contain Pencil2UMG.uplugin'})
+        else:
+            if os.path.isdir(plugin_dir):
+                shutil.rmtree(plugin_dir, ignore_errors=True)
+            shutil.copytree(src_plugin, plugin_dir)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            uproject_enabled = False
+            try:
+                proj_file = unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())
+                with open(proj_file, 'r', encoding='utf-8') as f:
+                    proj = _json.load(f)
+                plugins = proj.setdefault('Plugins', [])
+                found = False
+                for p in plugins:
+                    if isinstance(p, dict) and p.get('Name') == 'Pencil2UMG':
+                        p['Enabled'] = True; found = True; break
+                if not found:
+                    plugins.append({'Name': 'Pencil2UMG', 'Enabled': True})
+                with open(proj_file, 'w', encoding='utf-8') as f:
+                    _json.dump(proj, f, indent='\t')
+                uproject_enabled = True
+            except Exception:
+                uproject_enabled = False
+            _emit({'ok': True, 'action': action, 'installedVersion': latest_version,
+                   'previousVersion': installed_version, 'pluginDir': plugin_dir,
+                   'uprojectEnabled': uproject_enabled, 'restartRequired': True,
+                   'message': ('Pencil2UMG %s installed. RESTART the Unreal Editor so it loads '
+                               'the plugin before running ue_pencil_to_umg.' % latest_version)})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_pencil_to_umg -----------------------------------------------------
+    add(Tool{
+        "ue_pencil_to_umg",
+        "Convert a Pencil design file (.pen) into a UMG Widget Blueprint using the "
+        "installed Pencil2UMG plugin. Pass penFilePath (absolute path to the .pen "
+        "file) and optional packagePath (content path for the generated assets, "
+        "default \"/Game/UI\"). If the plugin is not installed this returns a "
+        "needsInstall payload; if installed but not yet loaded it returns a "
+        "needsRestart payload -- in both cases route through ue_pencil2umg_install "
+        "/ an editor restart first. Returns the created Widget Blueprint path plus "
+        "any importer warnings. Python recipe; requires PythonScriptPlugin and the "
+        "Pencil2UMG editor plugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"penFilePath", {{"type", "string"},
+                                {"description", "absolute path to a .pen file"}}},
+               {"packagePath", {{"type", "string"},
+                                {"description", "content path, default /Game/UI"}}}}},
+             {"required", json::array({"penFilePath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+import os
+pen = _ARGS.get('penFilePath') or ''
+pkg = _ARGS.get('packagePath') or '/Game/UI'
+plugins_dir = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_plugins_dir())
+installed = os.path.isfile(os.path.join(plugins_dir, 'Pencil2UMG', 'Pencil2UMG.uplugin'))
+if not pen:
+    _emit({'ok': False, 'error': 'penFilePath is required'})
+elif not os.path.isfile(pen):
+    _emit({'ok': False, 'error': 'pen file not found: %s' % pen})
+elif not hasattr(unreal, 'Pencil2UMGImporterLibrary'):
+    if installed:
+        _emit({'ok': False, 'needsRestart': True,
+               'error': 'Pencil2UMG is installed but its editor module is not loaded; '
+                        'restart the Unreal Editor and retry.'})
+    else:
+        _emit({'ok': False, 'needsInstall': True,
+               'error': 'Pencil2UMG plugin is not installed; run ue_pencil2umg_install (with '
+                        'confirm=true) and restart the editor, then retry.'})
+else:
+    res = unreal.Pencil2UMGImporterLibrary.import_pen_file(pen, pkg)
+    _emit({'ok': bool(res.success), 'assetPath': res.asset_path,
+           'importedAssets': list(res.imported_assets),
+           'warnings': list(res.warnings), 'errors': list(res.errors),
+           'error': '; '.join(res.errors) if (not res.success and res.errors) else None})
+)PY";
+            if (arg_str(args, "penFilePath").empty())
+                return ToolResult::error("penFilePath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Figma -> UMG conversion via the external Figma2UMG editor plugin
+// (Buvi Games, https://github.com/wellingfeng/figma2umg, MIT).
+//
+// Unlike Pencil2UMG this plugin has NO GitHub releases and ships as a SOURCE
+// editor module, so:
+//   * "latest" is tracked by the main-branch HEAD commit SHA (recorded in a
+//     .figma2umg_version marker we drop next to the .uplugin), and install
+//     pulls the source zipball.
+//   * After install/update the project must be (re)compiled — the editor builds
+//     the module on next startup — before the importer is usable.
+//   * Its import entry (UFigmaImportSubsystem::Request) is NOT a UFUNCTION, so
+//     it cannot be triggered from Python. ue_figma_to_umg therefore pre-fills
+//     the Figma AccessToken / FileKey / ContentRootFolder project settings and
+//     returns a manualStep payload telling the user to launch the import from
+//     the Content Browser context menu (the only supported trigger).
+//
+// The install is confirm-gated exactly like Pencil2UMG: one confirmation for
+// the initial install and one for each later update.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_figma2umg_tools() {
+    // -- ue_figma2umg_status --------------------------------------------------
+    add(Tool{
+        "ue_figma2umg_status",
+        "Report the Figma2UMG plugin state for Figma -> UMG conversion: the "
+        "version installed in this project's Plugins folder (its .uplugin "
+        "VersionName plus the source commit recorded at install), the latest "
+        "main-branch commit on GitHub (wellingfeng/figma2umg, which has no "
+        "tagged releases), whether an update is available, and whether the "
+        "Figma2UMG editor module is currently loaded/compiled. Call this when the "
+        "user wants to import a Figma design into UMG, to decide whether "
+        "ue_figma2umg_install is needed. Optional repo (owner/name) and branch "
+        "override the defaults. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"repo", {{"type", "string"},
+                         {"description", "owner/name, default wellingfeng/figma2umg"}}},
+               {"branch", {{"type", "string"},
+                           {"description", "default main"}}}}}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+import urllib.request, json as _json, os
+repo = _ARGS.get('repo') or 'wellingfeng/figma2umg'
+branch = _ARGS.get('branch') or 'main'
+plugins_dir = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_plugins_dir())
+plugin_dir = os.path.join(plugins_dir, 'Figma2UMG')
+uplugin = os.path.join(plugin_dir, 'Figma2UMG.uplugin')
+marker = os.path.join(plugin_dir, '.figma2umg_version')
+installed_version = None
+installed_commit = None
+if os.path.isfile(uplugin):
+    try:
+        with open(uplugin, 'r', encoding='utf-8') as f:
+            installed_version = _json.load(f).get('VersionName')
+    except Exception:
+        installed_version = '(unreadable)'
+if os.path.isfile(marker):
+    try:
+        with open(marker, 'r', encoding='utf-8') as f:
+            installed_commit = (f.read() or '').strip() or None
+    except Exception:
+        installed_commit = None
+latest_commit = None
+latest_date = None
+net_error = None
+try:
+    req = urllib.request.Request('https://api.github.com/repos/%s/commits/%s' % (repo, branch),
+                                 headers={'User-Agent': 'ue-mcp-for-all-versions',
+                                          'Accept': 'application/vnd.github+json'})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        c = _json.loads(resp.read().decode('utf-8'))
+    latest_commit = c.get('sha')
+    latest_date = (c.get('commit', {}).get('committer', {}) or {}).get('date')
+except Exception as e:
+    net_error = str(e)
+module_loaded = hasattr(unreal, 'FigmaImportSubsystem')
+update_available = bool(latest_commit and installed_commit and latest_commit != installed_commit)
+# If installed but we never recorded a commit, treat an update as available so
+# the user can refresh to a known state.
+if latest_commit and installed_version is not None and not installed_commit:
+    update_available = True
+_emit({'ok': True, 'repo': repo, 'branch': branch,
+       'installed': installed_version is not None,
+       'installedVersion': installed_version,
+       'installedCommit': installed_commit,
+       'latestCommit': latest_commit,
+       'latestCommitDate': latest_date,
+       'updateAvailable': update_available,
+       'moduleLoaded': module_loaded,
+       'compileRequired': bool(installed_version is not None and not module_loaded),
+       'pluginDir': plugin_dir,
+       'netError': net_error})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_figma2umg_install -------------------------------------------------
+    add(Tool{
+        "ue_figma2umg_install",
+        "Download and install (or update to) the latest Figma2UMG SOURCE from "
+        "GitHub (wellingfeng/figma2umg main branch) into this project's "
+        "Plugins/Figma2UMG folder, enable it in the .uproject, and record the "
+        "source commit. The repo has no tagged releases, so 'latest' means the "
+        "current main HEAD commit at call time. This is CONFIRM-GATED: call with "
+        "confirm=false (or omit it) first to get a needsConfirmation payload "
+        "describing the exact action (fresh install or from->to commit update); "
+        "only call with confirm=true after the user has explicitly agreed. The "
+        "user must confirm once for the initial install and again for any later "
+        "update. Set force=true to reinstall even when already on the latest "
+        "commit. Because Figma2UMG is a SOURCE plugin, after install/update the "
+        "Unreal Editor must RESTART and COMPILE the module before the importer "
+        "works (a C++ toolchain is required). Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"confirm", {{"type", "boolean"},
+                            {"description", "must be true to actually download/install"}}},
+               {"force", {{"type", "boolean"},
+                          {"description", "reinstall even if already on the latest commit"}}},
+               {"repo", {{"type", "string"},
+                         {"description", "owner/name, default wellingfeng/figma2umg"}}},
+               {"branch", {{"type", "string"}, {"description", "default main"}}}}}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+import urllib.request, json as _json, os, zipfile, tempfile, shutil
+repo = _ARGS.get('repo') or 'wellingfeng/figma2umg'
+branch = _ARGS.get('branch') or 'main'
+confirm = bool(_ARGS.get('confirm'))
+force = bool(_ARGS.get('force'))
+plugins_dir = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_plugins_dir())
+plugin_dir = os.path.join(plugins_dir, 'Figma2UMG')
+uplugin = os.path.join(plugin_dir, 'Figma2UMG.uplugin')
+marker = os.path.join(plugin_dir, '.figma2umg_version')
+installed_version = None
+installed_commit = None
+if os.path.isfile(uplugin):
+    try:
+        with open(uplugin, 'r', encoding='utf-8') as f:
+            installed_version = _json.load(f).get('VersionName')
+    except Exception:
+        installed_version = '(unreadable)'
+if os.path.isfile(marker):
+    try:
+        with open(marker, 'r', encoding='utf-8') as f:
+            installed_commit = (f.read() or '').strip() or None
+    except Exception:
+        installed_commit = None
+# Resolve latest commit.
+creq = urllib.request.Request('https://api.github.com/repos/%s/commits/%s' % (repo, branch),
+                              headers={'User-Agent': 'ue-mcp-for-all-versions',
+                                       'Accept': 'application/vnd.github+json'})
+with urllib.request.urlopen(creq, timeout=20) as resp:
+    c = _json.loads(resp.read().decode('utf-8'))
+latest_commit = c.get('sha')
+if not latest_commit:
+    _emit({'ok': False, 'error': 'could not resolve latest commit for %s@%s' % (repo, branch)})
+else:
+    is_update = installed_version is not None
+    up_to_date = is_update and installed_commit == latest_commit
+    action = 'reinstall' if (up_to_date and force) else ('update' if is_update else 'install')
+    if up_to_date and not force:
+        _emit({'ok': True, 'action': 'none', 'installedCommit': installed_commit,
+               'latestCommit': latest_commit,
+               'message': 'Figma2UMG is already on the latest commit; pass force=true to reinstall.'})
+    elif not confirm:
+        _emit({'ok': True, 'needsConfirmation': True, 'action': action,
+               'installedVersion': installed_version, 'installedCommit': installed_commit,
+               'latestCommit': latest_commit, 'pluginDir': plugin_dir,
+               'sourceInstall': True, 'compileRequired': True,
+               'message': ('A newer Figma2UMG source commit (%s) is available; updating from %s. '
+                           'Confirm to download and install (editor must recompile after).'
+                           % (latest_commit[:10], (installed_commit or 'unknown')[:10]))
+                          if is_update else
+                          ('Figma2UMG source (commit %s) will be downloaded from GitHub and '
+                           'installed into the project Plugins folder. It is a C++ source plugin, '
+                           'so the editor must recompile it on next startup. Confirm to proceed.'
+                           % latest_commit[:10])})
+    else:
+        tmpdir = tempfile.mkdtemp(prefix='figma2umg_')
+        zpath = os.path.join(tmpdir, 'src.zip')
+        zip_url = 'https://codeload.github.com/%s/zip/%s' % (repo, latest_commit)
+        dreq = urllib.request.Request(zip_url, headers={'User-Agent': 'ue-mcp-for-all-versions'})
+        with urllib.request.urlopen(dreq, timeout=180) as resp, open(zpath, 'wb') as out:
+            shutil.copyfileobj(resp, out)
+        extract_root = os.path.join(tmpdir, 'extract')
+        with zipfile.ZipFile(zpath) as zf:
+            zf.extractall(extract_root)
+        src_plugin = None
+        for root, _dirs, files in os.walk(extract_root):
+            if 'Figma2UMG.uplugin' in files:
+                src_plugin = root; break
+        if src_plugin is None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            _emit({'ok': False, 'error': 'downloaded archive did not contain Figma2UMG.uplugin'})
+        else:
+            if os.path.isdir(plugin_dir):
+                shutil.rmtree(plugin_dir, ignore_errors=True)
+            shutil.copytree(src_plugin, plugin_dir)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            try:
+                with open(os.path.join(plugin_dir, '.figma2umg_version'), 'w', encoding='utf-8') as f:
+                    f.write(latest_commit)
+            except Exception:
+                pass
+            new_version = None
+            try:
+                with open(os.path.join(plugin_dir, 'Figma2UMG.uplugin'), 'r', encoding='utf-8') as f:
+                    new_version = _json.load(f).get('VersionName')
+            except Exception:
+                new_version = None
+            uproject_enabled = False
+            try:
+                proj_file = unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())
+                with open(proj_file, 'r', encoding='utf-8') as f:
+                    proj = _json.load(f)
+                plugins = proj.setdefault('Plugins', [])
+                found = False
+                for p in plugins:
+                    if isinstance(p, dict) and p.get('Name') == 'Figma2UMG':
+                        p['Enabled'] = True; found = True; break
+                if not found:
+                    plugins.append({'Name': 'Figma2UMG', 'Enabled': True})
+                with open(proj_file, 'w', encoding='utf-8') as f:
+                    _json.dump(proj, f, indent='\t')
+                uproject_enabled = True
+            except Exception:
+                uproject_enabled = False
+            _emit({'ok': True, 'action': action, 'installedVersion': new_version,
+                   'installedCommit': latest_commit, 'previousCommit': installed_commit,
+                   'pluginDir': plugin_dir, 'uprojectEnabled': uproject_enabled,
+                   'restartRequired': True, 'compileRequired': True,
+                   'message': ('Figma2UMG source (commit %s) installed. It is a C++ source plugin: '
+                               'RESTART the Unreal Editor and let it COMPILE the module (a C++ '
+                               'toolchain is required) before running ue_figma_to_umg.'
+                               % latest_commit[:10])})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_figma_to_umg ------------------------------------------------------
+    add(Tool{
+        "ue_figma_to_umg",
+        "Prepare a Figma -> UMG import using the installed Figma2UMG plugin. Pass "
+        "accessToken (a Figma personal access token) and fileKey (the Figma file "
+        "or branch key), optional contentRootFolder (default \"/Game/Figma\"), and "
+        "optional nodeIds (array of Figma node ids to limit the import). This "
+        "writes those values into the Figma2UMG project settings so they are "
+        "pre-filled. NOTE: Figma2UMG's importer is a C++-only editor subsystem "
+        "with no scriptable (BlueprintCallable) entry point, so the actual import "
+        "must be launched by the user from the Content Browser context menu "
+        "(\"Import Figma file\") — this tool returns a manualStep payload with "
+        "those instructions. Returns needsInstall / needsCompile when the plugin "
+        "is not installed or not yet compiled. Python recipe; requires "
+        "PythonScriptPlugin and the Figma2UMG editor plugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"accessToken", {{"type", "string"},
+                                {"description", "Figma personal access token"}}},
+               {"fileKey", {{"type", "string"},
+                            {"description", "Figma file or branch key"}}},
+               {"contentRootFolder", {{"type", "string"},
+                                       {"description", "content path, default /Game/Figma"}}},
+               {"nodeIds", {{"type", "array"}, {"items", {{"type", "string"}}},
+                            {"description", "optional Figma node ids to limit import"}}}}},
+             {"required", json::array({"accessToken", "fileKey"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+import os
+token = _ARGS.get('accessToken') or ''
+file_key = _ARGS.get('fileKey') or ''
+root = _ARGS.get('contentRootFolder') or '/Game/Figma'
+node_ids = _ARGS.get('nodeIds') or []
+plugins_dir = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_plugins_dir())
+installed = os.path.isfile(os.path.join(plugins_dir, 'Figma2UMG', 'Figma2UMG.uplugin'))
+if not token or not file_key:
+    _emit({'ok': False, 'error': 'accessToken and fileKey are required'})
+elif not installed:
+    _emit({'ok': False, 'needsInstall': True,
+           'error': 'Figma2UMG plugin is not installed; run ue_figma2umg_install (with '
+                    'confirm=true), restart and compile the editor, then retry.'})
+elif not hasattr(unreal, 'Figma2UMGSettings'):
+    _emit({'ok': False, 'needsCompile': True,
+           'error': 'Figma2UMG is installed but its editor module is not loaded; restart the '
+                    'Unreal Editor and let it compile the C++ plugin, then retry.'})
+else:
+    saved = False
+    detail = None
+    try:
+        settings = unreal.get_default_object(unreal.Figma2UMGSettings)
+        settings.set_editor_property('AccessToken', token)
+        settings.set_editor_property('FileKey', file_key)
+        settings.set_editor_property('ContentRootFolder', root)
+        try:
+            settings.save_config()
+        except Exception:
+            pass
+        saved = True
+    except Exception as e:
+        detail = str(e)
+    _emit({'ok': saved, 'manualStep': True, 'settingsPrefilled': saved,
+           'contentRootFolder': root, 'nodeIds': list(node_ids), 'detail': detail,
+           'error': None if saved else ('could not pre-fill Figma2UMG settings: %s' % detail),
+           'instructions': ['The Figma2UMG importer has no scriptable entry point.',
+                            'In the Unreal Editor, right-click a folder in the Content Browser and '
+                            'choose "Import Figma file".',
+                            'The Access Token, File Key and import path have been pre-filled from '
+                            'the project settings; review them and click Import.']})
+)PY";
+            if (arg_str(args, "accessToken").empty() || arg_str(args, "fileKey").empty())
+                return ToolResult::error("accessToken and fileKey are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
 }  // namespace ue_mcp_for_all_versions
+

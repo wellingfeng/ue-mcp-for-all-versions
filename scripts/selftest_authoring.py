@@ -4,8 +4,19 @@
 Drives ONE long-lived MCP server against a running editor and exercises the new
 creation/authoring tools end to end:
 
-  create folder -> create material -> create blueprint -> create widget
-  blueprint (multi-strategy root) -> add a button + text to it -> compile.
+  create folder -> create material -> create blueprint -> create Character
+  blueprint -> configure movement / collision / camera -> create Enhanced Input
+  assets -> create widget blueprint (multi-strategy root) -> add a button +
+  text to it -> compile.
+
+Optional environment variables:
+  UEMCP_SELFTEST_SKELETON=/Game/.../SK_Mannequin_Skeleton
+      Also creates Animation Blueprint + speed BlendSpace assets.
+  UEMCP_SELFTEST_GAME_MAP=/Game/Maps/MyMap
+  UEMCP_SELFTEST_GAME_MODE=/Game/.../BP_GameMode
+      Also persists GameMapsSettings.
+  UEMCP_SELFTEST_RUN_PIE=1
+      Also runs the third-person PIE smoke test.
 
 Every step reports status; the widget-blueprint step prints strategiesTried so a
 stripped-Python build's behavior is visible rather than hidden.
@@ -51,8 +62,9 @@ def call(proc, name, args):
 def show(label, isErr, payload):
     status = payload.get("status")
     line = f"[{label}] isError={isErr} status={status}"
-    for k in ("assetPath", "rootSet", "addedToRoot", "variable", "compiled",
-              "missingCapability", "reason"):
+    for k in ("assetPath", "assetPaths", "rootSet", "addedToRoot", "variable",
+              "compiled", "cameraAdded", "targetHeightCm", "missingCapability",
+              "reason"):
         if k in payload:
             line += f" {k}={payload[k]}"
     print(line)
@@ -61,6 +73,8 @@ def show(label, isErr, payload):
             print(f"    strategy: {s}")
     if status == "error" and "error" in payload:
         print(f"    error: {payload['error']}")
+    if "diagnostics" in payload:
+        print(f"    diagnostics: {json.dumps(payload['diagnostics'], ensure_ascii=False)}")
     return payload
 
 
@@ -97,7 +111,62 @@ def main():
                          "parentClass": "/Script/Engine.Actor"})
         show("create_blueprint", isErr, p)
 
-        # 4) Widget Blueprint with a root (the login-screen scenario).
+        # 4) Gameplay Character Blueprint with standard movement defaults.
+        isErr, p = call(proc, "ue_create_character_blueprint",
+                        {"name": "BP_SelfTestCharacter", "packagePath": base,
+                         "reuseExisting": True})
+        show("create_character_blueprint", isErr, p)
+        character_path = p.get("assetPath")
+
+        if character_path:
+            isErr, p = call(proc, "ue_configure_character_movement",
+                            {"blueprintPath": character_path})
+            show("configure_character_movement", isErr, p)
+
+            isErr, p = call(proc, "ue_calibrate_character_collision",
+                            {"blueprintPath": character_path,
+                             "targetHeightCm": 180.0})
+            show("calibrate_character_collision", isErr, p)
+
+            isErr, p = call(proc, "ue_configure_third_person_camera",
+                            {"blueprintPath": character_path,
+                             "targetArmLength": 350.0,
+                             "socketOffset": {"x": 0.0, "y": 45.0, "z": 65.0}})
+            show("configure_third_person_camera", isErr, p)
+
+        isErr, p = call(proc, "ue_create_enhanced_input_assets",
+                        {"packagePath": base, "reuseExisting": True})
+        show("create_enhanced_input_assets", isErr, p)
+
+        skeleton = os.environ.get("UEMCP_SELFTEST_SKELETON", "")
+        if skeleton:
+            isErr, p = call(proc, "ue_create_locomotion_animation_assets",
+                            {"packagePath": base, "namePrefix": "SelfTest",
+                             "skeletonPath": skeleton, "reuseExisting": True})
+            show("create_locomotion_animation_assets", isErr, p)
+        else:
+            print("    [skip] create_locomotion_animation_assets — set UEMCP_SELFTEST_SKELETON")
+
+        game_map = os.environ.get("UEMCP_SELFTEST_GAME_MAP", "")
+        game_mode = os.environ.get("UEMCP_SELFTEST_GAME_MODE", "")
+        if game_map or game_mode:
+            isErr, p = call(proc, "ue_set_game_defaults",
+                            {"gameDefaultMap": game_map,
+                             "editorStartupMap": game_map,
+                             "gameModePath": game_mode})
+            show("set_game_defaults", isErr, p)
+        else:
+            print("    [skip] set_game_defaults — set UEMCP_SELFTEST_GAME_MAP or UEMCP_SELFTEST_GAME_MODE")
+
+        if os.environ.get("UEMCP_SELFTEST_RUN_PIE") == "1":
+            isErr, p = call(proc, "ue_validate_third_person_pie",
+                            {"expectedPawnClassPath": character_path or "",
+                             "startPie": True, "stopPie": True})
+            show("validate_third_person_pie", isErr, p)
+        else:
+            print("    [skip] validate_third_person_pie — set UEMCP_SELFTEST_RUN_PIE=1")
+
+        # 5) Widget Blueprint with a root (the login-screen scenario).
         isErr, p = call(proc, "ue_create_widget_blueprint",
                         {"name": "WBP_SelfTest", "packagePath": base,
                          "rootType": "CanvasPanel"})
@@ -105,17 +174,72 @@ def main():
         wbp_path = p.get("assetPath")
         root_ok = p.get("rootSet") or p.get("status") == "ok"
 
-        # 5) Add widgets only if the root exists.
+        # 6) Add widgets only if the root exists.
         if wbp_path and root_ok:
-            isErr, p = call(proc, "ue_add_widget_to_blueprint",
-                            {"blueprintPath": wbp_path, "widgetType": "TextBlock",
-                             "widgetName": "TitleText", "text": "Login"})
-            show("add_widget(TextBlock)", isErr, p)
+            isErr, p = call(proc, "ue_inspect_widget_blueprint",
+                            {"blueprintPath": wbp_path})
+            show("inspect_widget(initial)", isErr, p)
 
-            isErr, p = call(proc, "ue_add_widget_to_blueprint",
-                            {"blueprintPath": wbp_path, "widgetType": "Button",
-                             "widgetName": "LoginButton"})
-            show("add_widget(Button)", isErr, p)
+            isErr, p = call(proc, "ue_add_widget_to_panel",
+                            {"blueprintPath": wbp_path,
+                             "widgetType": "TextBlock",
+                             "widgetName": "TitleText",
+                             "properties": {
+                                 "text": "Login",
+                                 "fontSize": 32,
+                                 "color": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                             },
+                             "layout": {
+                                 "position": {"x": 64, "y": 64},
+                                 "size": {"x": 360, "y": 64},
+                                 "anchors": {"minX": 0, "minY": 0, "maxX": 0, "maxY": 0},
+                             }})
+            show("add_widget_to_panel(TextBlock)", isErr, p)
+
+            isErr, p = call(proc, "ue_add_widget_to_panel",
+                            {"blueprintPath": wbp_path,
+                             "widgetType": "Button",
+                             "widgetName": "LoginButton",
+                             "layout": {
+                                 "position": {"x": 64, "y": 144},
+                                 "size": {"x": 220, "y": 56},
+                             }})
+            show("add_widget_to_panel(Button)", isErr, p)
+
+            isErr, p = call(proc, "ue_set_widget_properties",
+                            {"blueprintPath": wbp_path,
+                             "widgetName": "LoginButton",
+                             "properties": {
+                                 "tooltipText": "Submit login",
+                                 "renderOpacity": 0.95,
+                             }})
+            show("set_widget_properties(Button)", isErr, p)
+
+            isErr, p = call(proc, "ue_configure_widget_layout",
+                            {"blueprintPath": wbp_path,
+                             "widgetName": "LoginButton",
+                             "layout": {
+                                 "position": {"x": 64, "y": 144},
+                                 "size": {"x": 240, "y": 56},
+                                 "zOrder": 1,
+                             }})
+            show("configure_widget_layout(Button)", isErr, p)
+
+            isErr, p = call(proc, "ue_inspect_widget_blueprint",
+                            {"blueprintPath": wbp_path})
+            show("inspect_widget(final)", isErr, p)
+
+            if os.environ.get("UEMCP_SELFTEST_WIDGET_COMPONENT") == "1":
+                isErr, p = call(proc, "ue_create_widget_component_blueprint",
+                                {"name": "BP_SelfTestWidgetActor",
+                                 "packagePath": base,
+                                 "widgetBlueprintPath": wbp_path,
+                                 "space": "World",
+                                 "drawSize": {"x": 500, "y": 300},
+                                 "reuseExisting": True})
+                show("create_widget_component_blueprint", isErr, p)
+            else:
+                print("    [skip] create_widget_component_blueprint — set UEMCP_SELFTEST_WIDGET_COMPONENT=1")
         else:
             print("    [skip] add_widget — no root widget was set on this build")
 

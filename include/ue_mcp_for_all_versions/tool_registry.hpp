@@ -115,6 +115,16 @@ private:
     void register_data_debug_tools();
     // Layer 2: blueprint + UMG authoring (Python recipes; multi-strategy).
     void register_authoring_tools();
+    // Pencil -> UMG conversion via the external Pencil2UMG editor plugin:
+    // status/version check, confirm-gated download of the latest GitHub
+    // release, and the actual .pen -> Widget Blueprint import.
+    void register_pencil2umg_tools();
+    // Figma -> UMG conversion via the external Figma2UMG editor plugin
+    // (Buvi Games, MIT). No prebuilt releases: status/update is tracked by the
+    // main-branch commit SHA, confirm-gated install pulls the source zipball,
+    // and the conversion tool pre-fills the Figma token / file key settings then
+    // guides the (C++-only, non-scriptable) import trigger.
+    void register_figma2umg_tools();
 
     std::vector<Tool> tools_;
 };
