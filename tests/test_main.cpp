@@ -188,6 +188,26 @@ static void test_mcp_dispatch() {
         CHECK(has_tool("ue_set_widget_properties"));
         CHECK(has_tool("ue_configure_widget_layout"));
         CHECK(has_tool("ue_create_widget_component_blueprint"));
+        // Layer 3: blueprint graph / PCG / terrain / sky / water / shader.
+        CHECK(has_tool("ue_add_blueprint_component"));
+        CHECK(has_tool("ue_set_blueprint_class_default"));
+        CHECK(has_tool("ue_reparent_blueprint"));
+        CHECK(has_tool("ue_add_blueprint_function"));
+        CHECK(has_tool("ue_create_pcg_graph"));
+        CHECK(has_tool("ue_spawn_pcg_volume"));
+        CHECK(has_tool("ue_assign_pcg_graph"));
+        CHECK(has_tool("ue_create_landscape"));
+        CHECK(has_tool("ue_set_landscape_material"));
+        CHECK(has_tool("ue_get_landscape_info"));
+        CHECK(has_tool("ue_setup_sky_atmosphere"));
+        CHECK(has_tool("ue_set_sun_direction"));
+        CHECK(has_tool("ue_set_fog_properties"));
+        CHECK(has_tool("ue_spawn_water_body"));
+        CHECK(has_tool("ue_set_water_body_properties"));
+        CHECK(has_tool("ue_add_material_expression"));
+        CHECK(has_tool("ue_connect_material_expressions"));
+        CHECK(has_tool("ue_connect_material_property"));
+        CHECK(has_tool("ue_set_material_properties"));
     }
 
     // unknown method -> -32601

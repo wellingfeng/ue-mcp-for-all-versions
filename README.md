@@ -153,7 +153,7 @@ You can start the CLI before the editor — the server connects lazily (see
 
 ## Tools
 
-110 tools, grouped below. Every tool is **capability-gated**: if the connected
+129 tools, grouped below. Every tool is **capability-gated**: if the connected
 engine lacks the required capability it returns
 `{"status":"unsupported", "reason": ..., "missingCapability": ...}` instead of
 failing. Tools marked *modern→legacy* call the UE5 editor subsystem first and
@@ -355,6 +355,83 @@ helpers. If configuring manually, enable `RemoteControl`,
 `EditorScriptingUtilities`, and `PythonScriptPlugin`. For Python tools on
 UE 5.x, setup also enables RemoteControl's remote Python execution project
 setting by default.
+
+### Blueprint graph authoring (Layer 3)
+
+Deeper Blueprint editing beyond create + variable: add components to the
+component tree, set class-default values, reparent, and add function graphs.
+Python recipes; require the PythonScriptPlugin (and UE5 `SubobjectDataSubsystem`
+/ `BlueprintEditorLibrary`). Component authoring degrades cleanly with
+`componentAdded=false` + `strategiesTried` on engines whose Python API can't
+reach the subobject API.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_add_blueprint_component` | python | Add a component (by friendly class name or `/Script` path) to a Blueprint's tree, optionally under a named parent scene component, via `SubobjectDataSubsystem` (UE5) |
+| `ue_set_blueprint_class_default` | python | Set a default property on the Blueprint's generated-class CDO (resolves content-path strings to assets/classes), then compile + save |
+| `ue_reparent_blueprint` | python | Change a Blueprint's parent class and recompile (UE5 `BlueprintEditorLibrary`) |
+| `ue_add_blueprint_function` | python | Add an empty function graph to a Blueprint (where the engine version exposes it) |
+
+### PCG — Procedural Content Generation (Layer 3)
+
+Create and drive [PCG](https://dev.epicgames.com/documentation/en-us/unreal-engine/procedural-content-generation-framework-in-unreal-engine)
+graphs. Requires the PCG plugin (enabled by default in UE 5.2+); when off, the
+`unreal.PCG*` symbols are absent and the tools return a clear "PCG plugin not
+enabled" error.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_create_pcg_graph` | python | Create a PCG Graph asset |
+| `ue_spawn_pcg_volume` | python | Spawn a `PCGVolume` (optional location/scale); optionally assign a graph and trigger generation |
+| `ue_assign_pcg_graph` | python | Assign a PCG Graph to an actor's `PCGComponent` and (optionally) generate |
+
+### Terrain — Landscape (Layer 3)
+
+Create a flat Landscape, assign its material, and read landscape info. Landscape
+authoring from Python is engine-version dependent (UE 5.3+ exposes the needed
+symbols); recipes probe for them and return `unsupported` otherwise.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_create_landscape` | python | Spawn a flat Landscape with configurable section size / components / scale, ready for sculpting or heightmap import |
+| `ue_set_landscape_material` | python | Assign a Material/MIC to a Landscape (by path or the first in the level) |
+| `ue_get_landscape_info` | python | List Landscape actors with bounds and assigned material |
+
+### Sky & atmosphere (Layer 3)
+
+Spawn and configure the modern sky stack. Actor classes exist 4.26+/5.x; spawn
+prefers `EditorActorSubsystem` (UE5) and falls back to `EditorLevelLibrary`.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_setup_sky_atmosphere` | python | Spawn/reuse `SkyAtmosphere` + sun `DirectionalLight` (as atmosphere sun) + `SkyLight` (real-time capture), optional `VolumetricCloud` and `ExponentialHeightFog`; set sun pitch/yaw |
+| `ue_set_sun_direction` | python | Rotate the sun (a `DirectionalLight`) to a pitch/yaw for time-of-day |
+| `ue_set_fog_properties` | python | Configure (or spawn) an `ExponentialHeightFog`: density, height falloff, start distance, color |
+
+### Water (Layer 3)
+
+Spawn and configure UE5 Water plugin bodies. Requires the Water plugin (UE 5.1+);
+when off, the tools return `unsupported`. River/island are spline-based and need
+their spline points authored in the editor afterward.
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_spawn_water_body` | python | Spawn `WaterBodyOcean` / `WaterBodyLake` / `WaterBodyRiver` / `WaterBodyIsland` (optional location/scale) |
+| `ue_set_water_body_properties` | python | Configure a water body's component: wave height, water material, tint color (property surface varies by version) |
+
+### Material shader authoring (Layer 3)
+
+Build real shader graphs (beyond `ue_create_material`'s constant base color):
+add expression nodes, wire them node→node and node→material-property, and set
+top-level material settings. Through `MaterialEditingLibrary` (present 4.25→5.x)
+plus Python (recipes instantiate expression `UClass`es by name).
+
+| Tool | Requires | Description |
+|------|----------|-------------|
+| `ue_add_material_expression` | python | Add a shader node (Constant, TextureSample, ScalarParameter, Multiply, Fresnel, …) at an optional position; returns a `nodeId` for wiring |
+| `ue_connect_material_expressions` | python | Wire one expression's output pin into another expression's input pin |
+| `ue_connect_material_property` | python | Connect an expression output to a material output property (BaseColor, Roughness, Normal, Emissive, Opacity, …) |
+| `ue_set_material_properties` | python | Set blend mode, shading model, and two-sided, then recompile |
 
 ### Pencil → UMG conversion (Layer 3 plugin)
 

@@ -125,6 +125,26 @@ private:
     // and the conversion tool pre-fills the Figma token / file key settings then
     // guides the (C++-only, non-scriptable) import trigger.
     void register_figma2umg_tools();
+    // Layer 3: deeper Blueprint authoring — add components (SubobjectData),
+    // set class-default properties, reparent, and add function graphs.
+    void register_blueprint_graph_tools();
+    // Layer 3: PCG (Procedural Content Generation) — create PCG graphs, spawn
+    // PCG volumes, assign a graph and trigger generation. PCG plugin (5.2+).
+    void register_pcg_tools();
+    // Layer 3: terrain / Landscape — create a flat landscape, set its material,
+    // import a heightmap, and read landscape info. Degrades on engines whose
+    // Python API can't author landscapes.
+    void register_terrain_tools();
+    // Layer 3: sky + atmosphere — spawn/configure SkyAtmosphere, the sun
+    // (DirectionalLight), SkyLight, VolumetricCloud, and ExponentialHeightFog.
+    void register_sky_atmosphere_tools();
+    // Layer 3: water — spawn and configure Water plugin bodies (ocean/lake/
+    // river/island). Degrades when the Water plugin is not enabled.
+    void register_water_tools();
+    // Layer 3: material shader authoring — add material expression nodes,
+    // connect them to each other or to material properties, and set top-level
+    // material properties (blend mode, shading model, two-sided), then recompile.
+    void register_material_shader_tools();
 
     std::vector<Tool> tools_;
 };

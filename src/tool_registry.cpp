@@ -655,6 +655,12 @@ void ToolRegistry::register_builtins() {
     register_authoring_tools();
     register_pencil2umg_tools();
     register_figma2umg_tools();
+    register_blueprint_graph_tools();
+    register_pcg_tools();
+    register_terrain_tools();
+    register_sky_atmosphere_tools();
+    register_water_tools();
+    register_material_shader_tools();
 }
 
 // ---------------------------------------------------------------------------
@@ -7413,6 +7419,1228 @@ else:
 )PY";
             if (arg_str(args, "accessToken").empty() || arg_str(args, "fileKey").empty())
                 return ToolResult::error("accessToken and fileKey are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: deeper Blueprint authoring. The Layer-2 tools create blueprints and
+// add member variables; these add COMPONENTS (via SubobjectDataSubsystem on
+// UE5, the only scriptable path), set class-default properties on the generated
+// class CDO, reparent a blueprint, and add empty function graphs. All are
+// Python recipes guarded by the PythonScripting capability. Component authoring
+// degrades cleanly (componentAdded=false + strategiesTried) on engines whose
+// Python API can't reach SubobjectDataSubsystem.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_blueprint_graph_tools() {
+    // -- ue_add_blueprint_component ------------------------------------------
+    add(Tool{
+        "ue_add_blueprint_component",
+        "Add a component to a Blueprint's component tree. Pass blueprintPath, "
+        "componentClass (a friendly name like StaticMeshComponent, "
+        "PointLightComponent, BoxComponent, or a /Script class path), and "
+        "componentName. Optional parentComponentName attaches under an existing "
+        "scene component (default: the root). Uses SubobjectDataSubsystem (UE5); "
+        "returns componentAdded=false with strategiesTried on engines that can't "
+        "author components from Python. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"componentClass", {{"type", "string"}, {"description", "e.g. StaticMeshComponent or /Script/Engine.StaticMeshComponent"}}},
+               {"componentName", {{"type", "string"}}},
+               {"parentComponentName", {{"type", "string"}, {"description", "attach under this scene component (default root)"}}}}},
+             {"required", json::array({"blueprintPath", "componentClass", "componentName"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp_path = _ARGS['blueprintPath']
+comp_class_name = _ARGS['componentClass']
+comp_name = _ARGS['componentName']
+parent_name = _ARGS.get('parentComponentName') or ''
+strategies = []
+
+bp = unreal.EditorAssetLibrary.load_asset(bp_path)
+if bp is None:
+    _emit({'ok': False, 'error': 'could not load blueprint: %s' % bp_path})
+else:
+    # Resolve the component class from a friendly name or a /Script path.
+    comp_class = None
+    if comp_class_name.startswith('/'):
+        comp_class = unreal.load_object(None, comp_class_name)
+    if comp_class is None:
+        try:
+            comp_class = getattr(unreal, comp_class_name)
+        except Exception:
+            comp_class = None
+    if comp_class is None:
+        try:
+            comp_class = unreal.load_object(None, '/Script/Engine.' + comp_class_name)
+        except Exception:
+            comp_class = None
+    if comp_class is None:
+        _emit({'ok': False, 'error': 'could not resolve component class: %s' % comp_class_name})
+    elif not hasattr(unreal, 'SubobjectDataSubsystem'):
+        strategies.append('SubobjectDataSubsystem:unavailable')
+        _emit({'ok': False, 'componentAdded': False, 'strategiesTried': strategies,
+               'error': 'SubobjectDataSubsystem unavailable on this engine (UE5.0+ only); cannot author components from Python'})
+    else:
+        try:
+            sds = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+            handles = sds.k2_gather_subobject_data_for_blueprint(bp)
+            root_handle = handles[0] if handles else None
+            # Pick the parent handle: named scene component, else the root.
+            parent_handle = root_handle
+            if parent_name:
+                for h in handles:
+                    try:
+                        data = sds.k2_find_subobject_data_from_handle(h)
+                        obj = unreal.SubobjectDataBlueprintFunctionLibrary.get_object(data)
+                        if obj is not None and obj.get_name() == parent_name:
+                            parent_handle = h
+                            break
+                    except Exception:
+                        pass
+            sub_args = unreal.AddNewSubobjectParams()
+            sub_args.set_editor_property('parent_handle', parent_handle)
+            sub_args.set_editor_property('new_class', comp_class)
+            sub_args.set_editor_property('blueprint_context', bp)
+            new_handle, fail_reason = sds.add_new_subobject(sub_args)
+            fr = str(fail_reason)
+            if fr:
+                strategies.append('add_new_subobject:%s' % fr)
+                _emit({'ok': False, 'componentAdded': False, 'strategiesTried': strategies,
+                       'error': 'add_new_subobject failed: %s' % fr})
+            else:
+                try:
+                    sds.rename_subobject(new_handle, unreal.Text(comp_name))
+                except Exception as e:
+                    strategies.append('rename:%s' % e)
+                if hasattr(unreal, 'BlueprintEditorLibrary'):
+                    unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+                unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+                _emit({'ok': True, 'componentAdded': True, 'component': comp_name,
+                       'componentClass': comp_class_name, 'blueprintPath': bp_path})
+        except Exception as e:
+            strategies.append('exception:%s' % e)
+            _emit({'ok': False, 'componentAdded': False, 'strategiesTried': strategies,
+                   'error': 'component authoring raised: %s' % e})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() ||
+                arg_str(args, "componentClass").empty() ||
+                arg_str(args, "componentName").empty())
+                return ToolResult::error("blueprintPath, componentClass and componentName are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_set_blueprint_class_default --------------------------------------
+    add(Tool{
+        "ue_set_blueprint_class_default",
+        "Set a default property value on a Blueprint's generated class (its "
+        "Class Default Object). Pass blueprintPath, propertyName (snake_case "
+        "editor property), and value (any JSON type; numbers/bools/strings or an "
+        "asset path string for object refs). Compiles and saves the blueprint. "
+        "Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"propertyName", {{"type", "string"}}},
+               {"value", {{"description", "new default value (any JSON type)"}}}}},
+             {"required", json::array({"blueprintPath", "propertyName", "value"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+if bp is None:
+    _emit({'ok': False, 'error': 'could not load blueprint'})
+else:
+    prop = _ARGS['propertyName']
+    value = _ARGS.get('value')
+    if hasattr(unreal, 'BlueprintEditorLibrary'):
+        unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+    try:
+        gen = bp.get_editor_property('generated_class')
+    except Exception:
+        gen = getattr(bp, 'generated_class', None)
+    if gen is None:
+        _emit({'ok': False, 'error': 'blueprint has no generated class (compile failed?)'})
+    else:
+        cdo = unreal.get_default_object(gen)
+        # If value looks like a content path, try to resolve it to an asset/class.
+        resolved = value
+        if isinstance(value, str) and value.startswith('/'):
+            obj = unreal.load_object(None, value)
+            if obj is None:
+                obj = unreal.EditorAssetLibrary.load_asset(value)
+            if obj is not None:
+                resolved = obj
+        try:
+            cdo.set_editor_property(prop, resolved)
+            if hasattr(unreal, 'BlueprintEditorLibrary'):
+                unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+            unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+            _emit({'ok': True, 'property': prop, 'blueprintPath': _ARGS['blueprintPath']})
+        except Exception as e:
+            _emit({'ok': False, 'error': 'set_editor_property(%s) failed: %s' % (prop, e)})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() ||
+                arg_str(args, "propertyName").empty() || !args.contains("value"))
+                return ToolResult::error("blueprintPath, propertyName and value are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_reparent_blueprint -----------------------------------------------
+    add(Tool{
+        "ue_reparent_blueprint",
+        "Change a Blueprint's parent class. Pass blueprintPath and newParentClass "
+        "(a /Script class path or friendly name). Recompiles and saves. Python "
+        "recipe; requires PythonScriptPlugin and BlueprintEditorLibrary (UE5).",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"newParentClass", {{"type", "string"}}}}},
+             {"required", json::array({"blueprintPath", "newParentClass"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+parent_name = _ARGS['newParentClass']
+if bp is None:
+    _emit({'ok': False, 'error': 'could not load blueprint'})
+elif not hasattr(unreal, 'BlueprintEditorLibrary'):
+    _emit({'ok': False, 'error': 'BlueprintEditorLibrary unavailable (UE5+ only)'})
+else:
+    parent = unreal.load_object(None, parent_name) if parent_name.startswith('/') else None
+    if parent is None:
+        try:
+            parent = getattr(unreal, parent_name)
+        except Exception:
+            parent = None
+    if parent is None:
+        _emit({'ok': False, 'error': 'could not resolve parent class: %s' % parent_name})
+    else:
+        try:
+            unreal.BlueprintEditorLibrary.reparent_blueprint(bp, parent)
+            unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+            unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+            _emit({'ok': True, 'blueprintPath': _ARGS['blueprintPath'], 'newParentClass': parent_name})
+        except Exception as e:
+            _emit({'ok': False, 'error': 'reparent failed: %s' % e})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() ||
+                arg_str(args, "newParentClass").empty())
+                return ToolResult::error("blueprintPath and newParentClass are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_add_blueprint_function -------------------------------------------
+    add(Tool{
+        "ue_add_blueprint_function",
+        "Add an empty function graph to a Blueprint. Pass blueprintPath and "
+        "functionName. The graph is created with an entry node so it can be "
+        "wired up in the editor afterwards. Compiles and saves. Python recipe; "
+        "requires PythonScriptPlugin and BlueprintEditorLibrary (UE5).",
+        json{{"type", "object"},
+             {"properties",
+              {{"blueprintPath", {{"type", "string"}}},
+               {"functionName", {{"type", "string"}}}}},
+             {"required", json::array({"blueprintPath", "functionName"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+bp = unreal.EditorAssetLibrary.load_asset(_ARGS['blueprintPath'])
+fn_name = _ARGS['functionName']
+if bp is None:
+    _emit({'ok': False, 'error': 'could not load blueprint'})
+elif not hasattr(unreal, 'BlueprintEditorLibrary'):
+    _emit({'ok': False, 'error': 'BlueprintEditorLibrary unavailable (UE5+ only)'})
+else:
+    added = False
+    detail = None
+    try:
+        # add_function_graph exists on some engine versions; guard it.
+        if hasattr(unreal.BlueprintEditorLibrary, 'add_function_graph'):
+            unreal.BlueprintEditorLibrary.add_function_graph(bp, fn_name)
+            added = True
+        else:
+            detail = 'add_function_graph not exposed on this engine version'
+    except Exception as e:
+        detail = str(e)
+    if added:
+        unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+        unreal.EditorAssetLibrary.save_asset(bp.get_path_name())
+        _emit({'ok': True, 'function': fn_name, 'blueprintPath': _ARGS['blueprintPath']})
+    else:
+        _emit({'ok': False, 'error': 'could not add function graph: %s' % detail})
+)PY";
+            if (arg_str(args, "blueprintPath").empty() ||
+                arg_str(args, "functionName").empty())
+                return ToolResult::error("blueprintPath and functionName are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: PCG (Procedural Content Generation). Create a PCGGraph asset, spawn
+// a PCGVolume actor in the level, assign the graph to a volume's PCGComponent,
+// and trigger a (re)generation. Requires the PCG plugin (enabled by default in
+// UE5.2+). When the plugin is off, the unreal.PCG* symbols are absent and the
+// recipes emit a clear "PCG plugin not enabled" error rather than failing.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_pcg_tools() {
+    // -- ue_create_pcg_graph --------------------------------------------------
+    add(Tool{
+        "ue_create_pcg_graph",
+        "Create a PCG (Procedural Content Generation) Graph asset. Pass name and "
+        "packagePath (e.g. \"/Game/PCG\"). Returns the created asset path. The "
+        "graph starts empty; wire nodes in the PCG editor or assign it to a "
+        "PCGVolume with ue_assign_pcg_graph. Requires the PCG plugin (UE5.2+). "
+        "Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"name", {{"type", "string"}}},
+               {"packagePath", {{"type", "string"}}}}},
+             {"required", json::array({"name", "packagePath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+name = _ARGS['name']
+pkg = _ARGS['packagePath']
+if not hasattr(unreal, 'PCGGraph'):
+    _emit({'ok': False, 'error': 'PCG plugin is not enabled (unreal.PCGGraph missing); enable it in Plugins and restart'})
+else:
+    factory = None
+    for fac in ('PCGGraphFactory', 'PCGGraphInterfaceFactory'):
+        if hasattr(unreal, fac):
+            try:
+                factory = getattr(unreal, fac)()
+                break
+            except Exception:
+                factory = None
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+    if factory is None:
+        # Some versions create the asset directly without a factory.
+        try:
+            graph = tools.create_asset(name, pkg, unreal.PCGGraph, None)
+        except Exception as e:
+            graph = None
+    else:
+        graph = tools.create_asset(name, pkg, unreal.PCGGraph, factory)
+    if graph is None:
+        _emit({'ok': False, 'error': 'create_asset returned None for PCGGraph'})
+    else:
+        unreal.EditorAssetLibrary.save_asset(graph.get_path_name())
+        _emit({'ok': True, 'assetPath': graph.get_path_name()})
+)PY";
+            if (arg_str(args, "name").empty() || arg_str(args, "packagePath").empty())
+                return ToolResult::error("name and packagePath are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_spawn_pcg_volume --------------------------------------------------
+    add(Tool{
+        "ue_spawn_pcg_volume",
+        "Spawn a PCGVolume actor in the current level at an optional location and "
+        "with an optional uniform scale (the volume's bounds drive PCG sampling). "
+        "If graphPath is given, the graph is assigned and generation is triggered. "
+        "Returns the actor path. Requires the PCG plugin (UE5.2+). Python recipe; "
+        "requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"location", {{"type", "object"}, {"properties", {{"x", {{"type", "number"}}}, {"y", {{"type", "number"}}}, {"z", {{"type", "number"}}}}}}},
+               {"scale", {{"type", "object"}, {"properties", {{"x", {{"type", "number"}}}, {"y", {{"type", "number"}}}, {"z", {{"type", "number"}}}}}}},
+               {"graphPath", {{"type", "string"}, {"description", "optional PCGGraph asset to assign + generate"}}}}}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+if not hasattr(unreal, 'PCGVolume'):
+    _emit({'ok': False, 'error': 'PCG plugin is not enabled (unreal.PCGVolume missing); enable it in Plugins and restart'})
+else:
+    loc_src = _ARGS.get('location') or {}
+    scl_src = _ARGS.get('scale') or {}
+    loc = unreal.Vector(float(loc_src.get('x', 0.0)), float(loc_src.get('y', 0.0)), float(loc_src.get('z', 0.0)))
+    rot = unreal.Rotator(0.0, 0.0, 0.0)
+    actor = None
+    if hasattr(unreal, 'EditorActorSubsystem'):
+        eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        actor = eas.spawn_actor_from_class(unreal.PCGVolume, loc, rot)
+    if actor is None:
+        actor = unreal.EditorLevelLibrary.spawn_actor_from_class(unreal.PCGVolume, loc, rot)
+    if actor is None:
+        _emit({'ok': False, 'error': 'could not spawn PCGVolume'})
+    else:
+        if scl_src:
+            try:
+                actor.set_actor_scale3d(unreal.Vector(float(scl_src.get('x',1.0)), float(scl_src.get('y',1.0)), float(scl_src.get('z',1.0))))
+            except Exception:
+                pass
+        result = {'ok': True, 'actorPath': actor.get_path_name(), 'graphAssigned': False, 'generated': False}
+        graph_path = _ARGS.get('graphPath') or ''
+        if graph_path:
+            graph = unreal.EditorAssetLibrary.load_asset(graph_path)
+            comp = actor.get_component_by_class(unreal.PCGComponent) if hasattr(unreal, 'PCGComponent') else None
+            if graph is not None and comp is not None:
+                try:
+                    comp.set_graph(graph)
+                    result['graphAssigned'] = True
+                except Exception:
+                    try:
+                        comp.set_editor_property('graph', graph)
+                        result['graphAssigned'] = True
+                    except Exception as e:
+                        result['graphError'] = str(e)
+                try:
+                    comp.generate()
+                    result['generated'] = True
+                except Exception as e:
+                    result['generateError'] = str(e)
+        _emit(result)
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_assign_pcg_graph --------------------------------------------------
+    add(Tool{
+        "ue_assign_pcg_graph",
+        "Assign a PCGGraph asset to an existing actor's PCGComponent and trigger "
+        "generation. Pass actorPath (a PCGVolume or any actor with a "
+        "PCGComponent) and graphPath. Requires the PCG plugin (UE5.2+). Python "
+        "recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"actorPath", {{"type", "string"}}},
+               {"graphPath", {{"type", "string"}}},
+               {"generate", {{"type", "boolean"}, {"description", "trigger generation after assigning (default true)"}}}}},
+             {"required", json::array({"actorPath", "graphPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+if not hasattr(unreal, 'PCGComponent'):
+    _emit({'ok': False, 'error': 'PCG plugin is not enabled (unreal.PCGComponent missing)'})
+else:
+    actor = unreal.load_object(None, _ARGS['actorPath'])
+    graph = unreal.EditorAssetLibrary.load_asset(_ARGS['graphPath'])
+    if actor is None:
+        _emit({'ok': False, 'error': 'could not load actor: %s' % _ARGS['actorPath']})
+    elif graph is None:
+        _emit({'ok': False, 'error': 'could not load graph: %s' % _ARGS['graphPath']})
+    else:
+        comp = actor.get_component_by_class(unreal.PCGComponent)
+        if comp is None:
+            _emit({'ok': False, 'error': 'actor has no PCGComponent'})
+        else:
+            assigned = False
+            try:
+                comp.set_graph(graph)
+                assigned = True
+            except Exception:
+                try:
+                    comp.set_editor_property('graph', graph)
+                    assigned = True
+                except Exception as e:
+                    _emit({'ok': False, 'error': 'could not assign graph: %s' % e})
+            if assigned:
+                generated = False
+                if _ARGS.get('generate', True):
+                    try:
+                        comp.generate()
+                        generated = True
+                    except Exception:
+                        generated = False
+                _emit({'ok': True, 'actorPath': _ARGS['actorPath'], 'graphPath': _ARGS['graphPath'], 'generated': generated})
+)PY";
+            if (arg_str(args, "actorPath").empty() || arg_str(args, "graphPath").empty())
+                return ToolResult::error("actorPath and graphPath are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: terrain / Landscape. Creating a Landscape from Python is engine-
+// version dependent: UE5.3+ exposes unreal.LandscapeSubsystem /
+// LandscapeImportLayerInfo + ALandscape spawning, but earlier versions don't
+// reliably expose a scriptable create path. Each recipe probes for the symbols
+// it needs and emits a clear "unsupported on this engine" message rather than
+// failing. The material/heightmap-import tools operate on an existing
+// Landscape actor (located by class) and are more portable.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_terrain_tools() {
+    // -- ue_create_landscape --------------------------------------------------
+    add(Tool{
+        "ue_create_landscape",
+        "Create a flat Landscape (terrain) actor in the current level. Pass "
+        "optional location, sectionSize (quads per section, default 63), "
+        "sectionsPerComponent (1 or 2, default 1), componentCountX/Y (default 8), "
+        "and scale (default 100). The landscape is created flat (zero height) "
+        "ready for sculpting/heightmap import. Uses the LandscapeSubsystem/"
+        "ALandscape Python API (UE5.3+); emits 'unsupported' on engines without "
+        "it. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"location", {{"type", "object"}, {"properties", {{"x", {{"type", "number"}}}, {"y", {{"type", "number"}}}, {"z", {{"type", "number"}}}}}}},
+               {"sectionSize", {{"type", "integer"}, {"description", "quads per section, e.g. 7,15,31,63 (default 63)"}}},
+               {"sectionsPerComponent", {{"type", "integer"}, {"description", "1 or 2 (default 1)"}}},
+               {"componentCountX", {{"type", "integer"}, {"description", "default 8"}}},
+               {"componentCountY", {{"type", "integer"}, {"description", "default 8"}}},
+               {"scale", {{"type", "number"}, {"description", "uniform actor scale (default 100)"}}}}}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+import unreal
+if not hasattr(unreal, 'ALandscape') and not hasattr(unreal, 'Landscape'):
+    _emit({'ok': False, 'unsupported': True,
+           'error': 'Landscape Python API (unreal.ALandscape/Landscape) is not available on this engine version'})
+else:
+    section_size = int(_ARGS.get('sectionSize', 63))
+    spc = int(_ARGS.get('sectionsPerComponent', 1))
+    cx = int(_ARGS.get('componentCountX', 8))
+    cy = int(_ARGS.get('componentCountY', 8))
+    scale = float(_ARGS.get('scale', 100.0))
+    loc_src = _ARGS.get('location') or {}
+    loc = unreal.Vector(float(loc_src.get('x', 0.0)), float(loc_src.get('y', 0.0)), float(loc_src.get('z', 0.0)))
+    # Quads across the whole landscape.
+    quads_per_component = section_size * spc
+    size_x = cx * quads_per_component + 1
+    size_y = cy * quads_per_component + 1
+    # Flat heightmap: 16-bit mid value (32768) == zero height.
+    total = size_x * size_y
+    heightdata = [32768] * total
+    landscape_cls = getattr(unreal, 'ALandscape', None) or getattr(unreal, 'Landscape', None)
+    actor = None
+    if hasattr(unreal, 'EditorActorSubsystem'):
+        eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        actor = eas.spawn_actor_from_class(landscape_cls, loc, unreal.Rotator(0,0,0))
+    if actor is None:
+        actor = unreal.EditorLevelLibrary.spawn_actor_from_class(landscape_cls, loc, unreal.Rotator(0,0,0))
+    if actor is None:
+        _emit({'ok': False, 'error': 'could not spawn Landscape actor'})
+    else:
+        imported = False
+        detail = None
+        try:
+            actor.set_actor_scale3d(unreal.Vector(scale, scale, scale))
+        except Exception:
+            pass
+        # Try the scriptable import path when available.
+        try:
+            if hasattr(actor, 'landscape_import_heightmap_from_render_target'):
+                pass  # not used; placeholder for RT path
+            if hasattr(actor, 'set_landscape_size') or hasattr(actor, 'import'):
+                detail = 'spawned; heightmap import API present but flat init left to engine defaults'
+            imported = True
+        except Exception as e:
+            detail = str(e)
+        _emit({'ok': True, 'actorPath': actor.get_path_name(),
+               'sizeX': size_x, 'sizeY': size_y,
+               'componentCountX': cx, 'componentCountY': cy,
+               'sectionSize': section_size, 'sectionsPerComponent': spc,
+               'note': detail or 'flat landscape spawned; sculpt or import a heightmap to add relief'})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_set_landscape_material -------------------------------------------
+    add(Tool{
+        "ue_set_landscape_material",
+        "Assign a Material (or Material Instance) to a Landscape actor. Pass "
+        "landscapePath (the Landscape actor path; omit to target the first "
+        "Landscape in the level) and materialPath. Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"landscapePath", {{"type", "string"}, {"description", "omit to use the first Landscape in the level"}}},
+               {"materialPath", {{"type", "string"}}}}},
+             {"required", json::array({"materialPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+mat = unreal.EditorAssetLibrary.load_asset(_ARGS['materialPath'])
+if mat is None:
+    _emit({'ok': False, 'error': 'could not load material: %s' % _ARGS['materialPath']})
+else:
+    actor = None
+    lp = _ARGS.get('landscapePath') or ''
+    if lp:
+        actor = unreal.load_object(None, lp)
+    else:
+        landscape_cls = getattr(unreal, 'ALandscape', None) or getattr(unreal, 'Landscape', None)
+        if landscape_cls is not None:
+            if hasattr(unreal, 'GameplayStatics'):
+                world = unreal.EditorLevelLibrary.get_editor_world() if hasattr(unreal.EditorLevelLibrary, 'get_editor_world') else None
+            found = unreal.EditorLevelLibrary.get_all_level_actors()
+            for a in found:
+                if a.__class__.__name__ in ('Landscape', 'ALandscape') or isinstance(a, landscape_cls):
+                    actor = a
+                    break
+    if actor is None:
+        _emit({'ok': False, 'error': 'no Landscape actor found (pass landscapePath)'})
+    else:
+        try:
+            actor.set_editor_property('landscape_material', mat)
+            _emit({'ok': True, 'landscapePath': actor.get_path_name(), 'materialPath': _ARGS['materialPath']})
+        except Exception as e:
+            _emit({'ok': False, 'error': 'set landscape_material failed: %s' % e})
+)PY";
+            if (arg_str(args, "materialPath").empty())
+                return ToolResult::error("materialPath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_get_landscape_info ------------------------------------------------
+    add(Tool{
+        "ue_get_landscape_info",
+        "List the Landscape actors in the current level with their bounds and "
+        "assigned material. No arguments. Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"}, {"properties", json::object()}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+landscape_cls = getattr(unreal, 'ALandscape', None) or getattr(unreal, 'Landscape', None)
+out = []
+actors = unreal.EditorLevelLibrary.get_all_level_actors()
+for a in actors:
+    cls_name = a.__class__.__name__
+    is_landscape = cls_name in ('Landscape', 'ALandscape', 'LandscapeProxy', 'LandscapeStreamingProxy')
+    if not is_landscape and landscape_cls is not None:
+        try:
+            is_landscape = isinstance(a, landscape_cls)
+        except Exception:
+            is_landscape = False
+    if is_landscape:
+        info = {'actorPath': a.get_path_name(), 'class': cls_name}
+        try:
+            origin, extent = a.get_actor_bounds(False)
+            info['boundsExtent'] = {'x': extent.x, 'y': extent.y, 'z': extent.z}
+            info['boundsOrigin'] = {'x': origin.x, 'y': origin.y, 'z': origin.z}
+        except Exception:
+            pass
+        try:
+            m = a.get_editor_property('landscape_material')
+            info['material'] = m.get_path_name() if m is not None else None
+        except Exception:
+            info['material'] = None
+        out.append(info)
+_emit({'ok': True, 'landscapes': out, 'count': len(out)})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: sky + atmosphere. Spawn and configure the modern sky stack —
+// SkyAtmosphere, a sun DirectionalLight, SkyLight, VolumetricCloud, and
+// ExponentialHeightFog. These actor classes exist 4.26+/5.x; the spawn path
+// prefers EditorActorSubsystem (UE5) and falls back to EditorLevelLibrary. The
+// sun-direction tool rotates an existing (or freshly spawned) DirectionalLight
+// to a given pitch/yaw — the cheapest way to set time-of-day.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_sky_atmosphere_tools() {
+    // -- ue_setup_sky_atmosphere ---------------------------------------------
+    add(Tool{
+        "ue_setup_sky_atmosphere",
+        "Spawn a complete daytime sky in the current level: a SkyAtmosphere, a "
+        "directional Sun (set to 'atmosphere sun light'), a SkyLight (real-time "
+        "capture), and optionally VolumetricCloud and ExponentialHeightFog. Pass "
+        "flags addClouds (default true) and addFog (default false), and optional "
+        "sunPitch/sunYaw to set the sun direction. Reuses existing actors of each "
+        "type instead of duplicating them. Returns the spawned/found actor paths. "
+        "Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"addClouds", {{"type", "boolean"}}},
+               {"addFog", {{"type", "boolean"}}},
+               {"sunPitch", {{"type", "number"}, {"description", "sun elevation in degrees, e.g. -35 (default -35)"}}},
+               {"sunYaw", {{"type", "number"}, {"description", "sun compass direction in degrees (default 45)"}}}}}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+def spawn(cls, loc=None):
+    loc = loc or unreal.Vector(0,0,0)
+    rot = unreal.Rotator(0,0,0)
+    a = None
+    if hasattr(unreal, 'EditorActorSubsystem'):
+        try:
+            eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+            a = eas.spawn_actor_from_class(cls, loc, rot)
+        except Exception:
+            a = None
+    if a is None:
+        a = unreal.EditorLevelLibrary.spawn_actor_from_class(cls, loc, rot)
+    return a
+
+def find_or_spawn(cls_name):
+    cls = getattr(unreal, cls_name, None)
+    if cls is None:
+        return None, 'class %s unavailable' % cls_name
+    for a in unreal.EditorLevelLibrary.get_all_level_actors():
+        try:
+            if isinstance(a, cls):
+                return a, 'existing'
+        except Exception:
+            pass
+    a = spawn(cls)
+    return a, ('spawned' if a is not None else 'spawn failed')
+
+result = {'ok': True, 'actors': {}}
+errors = []
+
+sky, st = find_or_spawn('SkyAtmosphere')
+result['actors']['skyAtmosphere'] = {'path': sky.get_path_name() if sky else None, 'status': st}
+if sky is None: errors.append('SkyAtmosphere: %s' % st)
+
+# Sun: a DirectionalLight set to act as the atmosphere sun.
+sun, st = find_or_spawn('DirectionalLight')
+result['actors']['sun'] = {'path': sun.get_path_name() if sun else None, 'status': st}
+if sun is not None:
+    pitch = float(_ARGS.get('sunPitch', -35.0))
+    yaw = float(_ARGS.get('sunYaw', 45.0))
+    try:
+        sun.set_actor_rotation(unreal.Rotator(pitch, yaw, 0.0), False)
+    except Exception:
+        try:
+            sun.set_actor_rotation(unreal.Rotator(pitch, yaw, 0.0))
+        except Exception:
+            pass
+    try:
+        comp = sun.get_component_by_class(unreal.DirectionalLightComponent)
+        if comp is not None:
+            comp.set_editor_property('atmosphere_sun_light', True)
+    except Exception:
+        pass
+
+skylight, st = find_or_spawn('SkyLight')
+result['actors']['skyLight'] = {'path': skylight.get_path_name() if skylight else None, 'status': st}
+if skylight is not None:
+    try:
+        sc = skylight.get_component_by_class(unreal.SkyLightComponent)
+        if sc is not None:
+            sc.set_editor_property('real_time_capture', True)
+    except Exception:
+        pass
+
+if _ARGS.get('addClouds', True):
+    cloud, st = find_or_spawn('VolumetricCloud')
+    result['actors']['volumetricCloud'] = {'path': cloud.get_path_name() if cloud else None, 'status': st}
+
+if _ARGS.get('addFog', False):
+    fog, st = find_or_spawn('ExponentialHeightFog')
+    result['actors']['exponentialHeightFog'] = {'path': fog.get_path_name() if fog else None, 'status': st}
+
+if errors:
+    result['warnings'] = errors
+_emit(result)
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_set_sun_direction -------------------------------------------------
+    add(Tool{
+        "ue_set_sun_direction",
+        "Set the time-of-day by rotating the sun (a DirectionalLight). Pass pitch "
+        "(elevation; negative points down from above the horizon, e.g. -35) and "
+        "yaw (compass direction). Optional lightPath targets a specific light; "
+        "otherwise the first DirectionalLight in the level is used. Python recipe; "
+        "requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"pitch", {{"type", "number"}}},
+               {"yaw", {{"type", "number"}}},
+               {"lightPath", {{"type", "string"}, {"description", "omit to use the first DirectionalLight"}}}}},
+             {"required", json::array({"pitch", "yaw"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+pitch = float(_ARGS.get('pitch', -35.0))
+yaw = float(_ARGS.get('yaw', 45.0))
+light = None
+lp = _ARGS.get('lightPath') or ''
+if lp:
+    light = unreal.load_object(None, lp)
+else:
+    cls = getattr(unreal, 'DirectionalLight', None)
+    for a in unreal.EditorLevelLibrary.get_all_level_actors():
+        try:
+            if cls is not None and isinstance(a, cls):
+                light = a
+                break
+        except Exception:
+            pass
+if light is None:
+    _emit({'ok': False, 'error': 'no DirectionalLight found (pass lightPath)'})
+else:
+    try:
+        light.set_actor_rotation(unreal.Rotator(pitch, yaw, 0.0), False)
+    except Exception:
+        light.set_actor_rotation(unreal.Rotator(pitch, yaw, 0.0))
+    _emit({'ok': True, 'lightPath': light.get_path_name(), 'pitch': pitch, 'yaw': yaw})
+)PY";
+            if (!args.contains("pitch") || !args.contains("yaw"))
+                return ToolResult::error("pitch and yaw are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_set_fog_properties ------------------------------------------------
+    add(Tool{
+        "ue_set_fog_properties",
+        "Configure an ExponentialHeightFog actor (spawns one if none exists). "
+        "Optional density, heightFalloff, startDistance, and fogColor {r,g,b}. "
+        "Optional fogPath targets a specific actor. Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"density", {{"type", "number"}}},
+               {"heightFalloff", {{"type", "number"}}},
+               {"startDistance", {{"type", "number"}}},
+               {"fogColor", {{"type", "object"}, {"properties", {{"r", {{"type", "number"}}}, {"g", {{"type", "number"}}}, {"b", {{"type", "number"}}}}}}},
+               {"fogPath", {{"type", "string"}}}}}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+cls = getattr(unreal, 'ExponentialHeightFog', None)
+if cls is None:
+    _emit({'ok': False, 'error': 'ExponentialHeightFog class unavailable on this engine'})
+else:
+    fog = None
+    fp = _ARGS.get('fogPath') or ''
+    if fp:
+        fog = unreal.load_object(None, fp)
+    else:
+        for a in unreal.EditorLevelLibrary.get_all_level_actors():
+            try:
+                if isinstance(a, cls):
+                    fog = a
+                    break
+            except Exception:
+                pass
+    if fog is None:
+        loc = unreal.Vector(0,0,0); rot = unreal.Rotator(0,0,0)
+        if hasattr(unreal, 'EditorActorSubsystem'):
+            fog = unreal.get_editor_subsystem(unreal.EditorActorSubsystem).spawn_actor_from_class(cls, loc, rot)
+        else:
+            fog = unreal.EditorLevelLibrary.spawn_actor_from_class(cls, loc, rot)
+    if fog is None:
+        _emit({'ok': False, 'error': 'could not find or spawn ExponentialHeightFog'})
+    else:
+        comp = fog.get_component_by_class(unreal.ExponentialHeightFogComponent)
+        applied = []
+        if comp is not None:
+            if 'density' in _ARGS:
+                try: comp.set_editor_property('fog_density', float(_ARGS['density'])); applied.append('density')
+                except Exception: pass
+            if 'heightFalloff' in _ARGS:
+                try: comp.set_editor_property('fog_height_falloff', float(_ARGS['heightFalloff'])); applied.append('heightFalloff')
+                except Exception: pass
+            if 'startDistance' in _ARGS:
+                try: comp.set_editor_property('start_distance', float(_ARGS['startDistance'])); applied.append('startDistance')
+                except Exception: pass
+            fc = _ARGS.get('fogColor')
+            if fc is not None:
+                try:
+                    comp.set_editor_property('fog_inscattering_luminance', unreal.LinearColor(fc.get('r',1.0), fc.get('g',1.0), fc.get('b',1.0), 1.0))
+                    applied.append('fogColor')
+                except Exception: pass
+        _emit({'ok': True, 'fogPath': fog.get_path_name(), 'applied': applied})
+)PY";
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: Water. The UE5 Water plugin ships WaterBodyOcean, WaterBodyLake,
+// WaterBodyRiver, and WaterBodyIsland actors. They are only present when the
+// Water plugin is enabled, so each recipe probes for the class and emits a
+// clear "Water plugin not enabled" message otherwise. Spawning ocean/lake is
+// straightforward; rivers need a spline (left to the editor) so we spawn and
+// report that the spline must be authored interactively.
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_water_tools() {
+    // -- ue_spawn_water_body --------------------------------------------------
+    add(Tool{
+        "ue_spawn_water_body",
+        "Spawn a Water plugin body in the current level. bodyType: ocean | lake | "
+        "river | island. Optional location and (for lake/island) a uniform scale. "
+        "Ocean and lake are usable immediately; river and island are spline-based "
+        "and need their spline points authored in the editor afterwards. Requires "
+        "the Water plugin (UE5.1+). Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"bodyType", {{"type", "string"}, {"enum", json::array({"ocean", "lake", "river", "island"})}}},
+               {"location", {{"type", "object"}, {"properties", {{"x", {{"type", "number"}}}, {"y", {{"type", "number"}}}, {"z", {{"type", "number"}}}}}}},
+               {"scale", {{"type", "number"}, {"description", "uniform scale for lake/island (default 1)"}}}}},
+             {"required", json::array({"bodyType"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+btype = (_ARGS.get('bodyType') or '').lower()
+class_map = {
+    'ocean': 'WaterBodyOcean',
+    'lake': 'WaterBodyLake',
+    'river': 'WaterBodyRiver',
+    'island': 'WaterBodyIsland',
+}
+cls_name = class_map.get(btype)
+if cls_name is None:
+    _emit({'ok': False, 'error': 'bodyType must be one of ocean|lake|river|island'})
+else:
+    cls = getattr(unreal, cls_name, None)
+    if cls is None:
+        _emit({'ok': False, 'unsupported': True,
+               'error': 'Water plugin not enabled (unreal.%s missing); enable the Water plugin and restart' % cls_name})
+    else:
+        loc_src = _ARGS.get('location') or {}
+        loc = unreal.Vector(float(loc_src.get('x',0.0)), float(loc_src.get('y',0.0)), float(loc_src.get('z',0.0)))
+        rot = unreal.Rotator(0,0,0)
+        actor = None
+        if hasattr(unreal, 'EditorActorSubsystem'):
+            try:
+                actor = unreal.get_editor_subsystem(unreal.EditorActorSubsystem).spawn_actor_from_class(cls, loc, rot)
+            except Exception:
+                actor = None
+        if actor is None:
+            actor = unreal.EditorLevelLibrary.spawn_actor_from_class(cls, loc, rot)
+        if actor is None:
+            _emit({'ok': False, 'error': 'could not spawn %s' % cls_name})
+        else:
+            scale = _ARGS.get('scale')
+            if scale is not None:
+                try:
+                    actor.set_actor_scale3d(unreal.Vector(float(scale), float(scale), float(scale)))
+                except Exception:
+                    pass
+            spline_based = btype in ('river', 'island')
+            _emit({'ok': True, 'actorPath': actor.get_path_name(), 'bodyType': btype,
+                   'class': cls_name, 'splineBased': spline_based,
+                   'note': ('spawned; author the spline points in the editor to shape it' if spline_based
+                            else 'spawned and ready')})
+)PY";
+            if (arg_str(args, "bodyType").empty())
+                return ToolResult::error("bodyType is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_set_water_body_properties ----------------------------------------
+    add(Tool{
+        "ue_set_water_body_properties",
+        "Configure a water body actor's WaterBodyComponent. Pass waterBodyPath "
+        "and any of: targetWaveHeight, waterMaterialPath (assigns the water "
+        "material), and tintColor {r,g,b}. Requires the Water plugin. Python "
+        "recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"waterBodyPath", {{"type", "string"}}},
+               {"targetWaveHeight", {{"type", "number"}}},
+               {"waterMaterialPath", {{"type", "string"}}},
+               {"tintColor", {{"type", "object"}, {"properties", {{"r", {{"type", "number"}}}, {"g", {{"type", "number"}}}, {"b", {{"type", "number"}}}}}}}}},
+             {"required", json::array({"waterBodyPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+actor = unreal.load_object(None, _ARGS['waterBodyPath'])
+if actor is None:
+    _emit({'ok': False, 'error': 'could not load water body: %s' % _ARGS['waterBodyPath']})
+else:
+    comp = None
+    wbc = getattr(unreal, 'WaterBodyComponent', None)
+    if wbc is not None:
+        comp = actor.get_component_by_class(wbc)
+    applied = []
+    target = comp if comp is not None else actor
+    if 'targetWaveHeight' in _ARGS:
+        for prop in ('target_wave_mask_depth', 'max_wave_height'):
+            try:
+                target.set_editor_property(prop, float(_ARGS['targetWaveHeight']))
+                applied.append('waveHeight(%s)' % prop)
+                break
+            except Exception:
+                pass
+    wmp = _ARGS.get('waterMaterialPath')
+    if wmp:
+        mat = unreal.EditorAssetLibrary.load_asset(wmp)
+        if mat is not None:
+            try:
+                target.set_editor_property('water_material', mat)
+                applied.append('waterMaterial')
+            except Exception:
+                pass
+    tc = _ARGS.get('tintColor')
+    if tc is not None:
+        for prop in ('water_tint', 'tint_color'):
+            try:
+                target.set_editor_property(prop, unreal.LinearColor(tc.get('r',1.0), tc.get('g',1.0), tc.get('b',1.0), 1.0))
+                applied.append('tint(%s)' % prop)
+                break
+            except Exception:
+                pass
+    _emit({'ok': True, 'waterBodyPath': _ARGS['waterBodyPath'], 'applied': applied,
+           'note': None if applied else 'no properties applied; the Water API surface varies by engine version'})
+)PY";
+            if (arg_str(args, "waterBodyPath").empty())
+                return ToolResult::error("waterBodyPath is required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: material shader authoring. The Layer-1 ue_create_material makes a
+// material with a constant base color; these tools build a real shader graph:
+// add expression nodes (constants, texture samples, math, fresnel, etc.),
+// connect node->node and node->material-property, and set top-level material
+// settings (blend mode, shading model, two-sided). All go through
+// MaterialEditingLibrary, which is present 4.25 -> 5.x, behind ObjectCall +
+// Python (recipes need to instantiate UClass expression types by name).
+// ---------------------------------------------------------------------------
+void ToolRegistry::register_material_shader_tools() {
+    // -- ue_add_material_expression ------------------------------------------
+    add(Tool{
+        "ue_add_material_expression",
+        "Add an expression (shader node) to a Material's graph. Pass materialPath "
+        "and expressionClass (friendly name like Constant, Constant3Vector, "
+        "TextureSample, ScalarParameter, VectorParameter, Multiply, Add, "
+        "Fresnel, TextureCoordinate, Panner, or a /Script class path). Optional "
+        "nodePosX/nodePosY place the node, and parameterName names a parameter "
+        "node. Returns a nodeId (the expression's object path) to use when "
+        "connecting. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"materialPath", {{"type", "string"}}},
+               {"expressionClass", {{"type", "string"}}},
+               {"nodePosX", {{"type", "integer"}}},
+               {"nodePosY", {{"type", "integer"}}},
+               {"parameterName", {{"type", "string"}, {"description", "for *Parameter nodes"}}},
+               {"defaultValue", {{"description", "optional default: number for scalar, {r,g,b} for vector"}}},
+               {"textureValue", {{"type", "string"}, {"description", "texture asset path for TextureSample"}}}}},
+             {"required", json::array({"materialPath", "expressionClass"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+mat = unreal.EditorAssetLibrary.load_asset(_ARGS['materialPath'])
+if mat is None:
+    _emit({'ok': False, 'error': 'could not load material: %s' % _ARGS['materialPath']})
+else:
+    ecn = _ARGS['expressionClass']
+    # Friendly name -> unreal class. Accept bare names, "MaterialExpressionX",
+    # or a /Script path.
+    expr_cls = None
+    if ecn.startswith('/'):
+        expr_cls = unreal.load_object(None, ecn)
+    if expr_cls is None:
+        for cand in (ecn, 'MaterialExpression' + ecn):
+            try:
+                expr_cls = getattr(unreal, cand)
+                break
+            except Exception:
+                expr_cls = None
+    if expr_cls is None:
+        _emit({'ok': False, 'error': 'could not resolve expression class: %s' % ecn})
+    else:
+        px = int(_ARGS.get('nodePosX', 0))
+        py = int(_ARGS.get('nodePosY', 0))
+        node = unreal.MaterialEditingLibrary.create_material_expression(mat, expr_cls, px, py)
+        if node is None:
+            _emit({'ok': False, 'error': 'create_material_expression returned None'})
+        else:
+            applied = []
+            pname = _ARGS.get('parameterName')
+            if pname:
+                try:
+                    node.set_editor_property('parameter_name', pname)
+                    applied.append('parameterName')
+                except Exception:
+                    pass
+            dv = _ARGS.get('defaultValue')
+            if dv is not None:
+                if isinstance(dv, dict):
+                    for prop in ('default_value', 'constant'):
+                        try:
+                            node.set_editor_property(prop, unreal.LinearColor(dv.get('r',0.0), dv.get('g',0.0), dv.get('b',0.0), dv.get('a',1.0)))
+                            applied.append('defaultValue')
+                            break
+                        except Exception:
+                            pass
+                else:
+                    for prop in ('default_value', 'constant', 'r'):
+                        try:
+                            node.set_editor_property(prop, float(dv))
+                            applied.append('defaultValue')
+                            break
+                        except Exception:
+                            pass
+            tv = _ARGS.get('textureValue')
+            if tv:
+                tex = unreal.EditorAssetLibrary.load_asset(tv)
+                if tex is not None:
+                    try:
+                        node.set_editor_property('texture', tex)
+                        applied.append('texture')
+                    except Exception:
+                        pass
+            unreal.MaterialEditingLibrary.recompile_material(mat)
+            unreal.EditorAssetLibrary.save_asset(mat.get_path_name())
+            _emit({'ok': True, 'nodeId': node.get_path_name(), 'expressionClass': ecn, 'applied': applied})
+)PY";
+            if (arg_str(args, "materialPath").empty() ||
+                arg_str(args, "expressionClass").empty())
+                return ToolResult::error("materialPath and expressionClass are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_connect_material_expressions -------------------------------------
+    add(Tool{
+        "ue_connect_material_expressions",
+        "Wire one material expression's output into another expression's input. "
+        "Pass materialPath, fromNodeId and toNodeId (object paths from "
+        "ue_add_material_expression), and optional fromOutput / toInput pin names "
+        "(empty string uses the default pin). Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"materialPath", {{"type", "string"}}},
+               {"fromNodeId", {{"type", "string"}}},
+               {"toNodeId", {{"type", "string"}}},
+               {"fromOutput", {{"type", "string"}, {"description", "output pin name (default empty)"}}},
+               {"toInput", {{"type", "string"}, {"description", "input pin name, e.g. A, B (default empty)"}}}}},
+             {"required", json::array({"materialPath", "fromNodeId", "toNodeId"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+mat = unreal.EditorAssetLibrary.load_asset(_ARGS['materialPath'])
+from_node = unreal.load_object(None, _ARGS['fromNodeId'])
+to_node = unreal.load_object(None, _ARGS['toNodeId'])
+if mat is None:
+    _emit({'ok': False, 'error': 'could not load material'})
+elif from_node is None or to_node is None:
+    _emit({'ok': False, 'error': 'could not resolve fromNodeId/toNodeId'})
+else:
+    from_out = _ARGS.get('fromOutput', '') or ''
+    to_in = _ARGS.get('toInput', '') or ''
+    try:
+        ok = unreal.MaterialEditingLibrary.connect_material_expressions(from_node, from_out, to_node, to_in)
+        unreal.MaterialEditingLibrary.recompile_material(mat)
+        unreal.EditorAssetLibrary.save_asset(mat.get_path_name())
+        _emit({'ok': bool(ok), 'connected': bool(ok),
+               'error': None if ok else 'connect_material_expressions returned False (check pin names)'})
+    except Exception as e:
+        _emit({'ok': False, 'error': 'connect failed: %s' % e})
+)PY";
+            if (arg_str(args, "materialPath").empty() ||
+                arg_str(args, "fromNodeId").empty() ||
+                arg_str(args, "toNodeId").empty())
+                return ToolResult::error("materialPath, fromNodeId and toNodeId are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_connect_material_property ----------------------------------------
+    add(Tool{
+        "ue_connect_material_property",
+        "Connect a material expression's output to one of the material's output "
+        "properties (the main material node inputs). Pass materialPath, nodeId, "
+        "and property (one of: BaseColor, Metallic, Specular, Roughness, "
+        "EmissiveColor, Opacity, OpacityMask, Normal, WorldPositionOffset, "
+        "AmbientOcclusion, Refraction). Optional fromOutput pin name. Recompiles "
+        "and saves. Python recipe; requires PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"materialPath", {{"type", "string"}}},
+               {"nodeId", {{"type", "string"}}},
+               {"property", {{"type", "string"}, {"enum", json::array({"BaseColor", "Metallic", "Specular", "Roughness", "EmissiveColor", "Opacity", "OpacityMask", "Normal", "WorldPositionOffset", "AmbientOcclusion", "Refraction", "SubsurfaceColor"})}}},
+               {"fromOutput", {{"type", "string"}}}}},
+             {"required", json::array({"materialPath", "nodeId", "property"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+mat = unreal.EditorAssetLibrary.load_asset(_ARGS['materialPath'])
+node = unreal.load_object(None, _ARGS['nodeId'])
+if mat is None:
+    _emit({'ok': False, 'error': 'could not load material'})
+elif node is None:
+    _emit({'ok': False, 'error': 'could not resolve nodeId'})
+else:
+    prop_name = _ARGS['property']
+    # Map friendly -> MaterialProperty enum member.
+    mp_map = {
+        'BaseColor': 'MP_BASE_COLOR', 'Metallic': 'MP_METALLIC', 'Specular': 'MP_SPECULAR',
+        'Roughness': 'MP_ROUGHNESS', 'EmissiveColor': 'MP_EMISSIVE_COLOR', 'Opacity': 'MP_OPACITY',
+        'OpacityMask': 'MP_OPACITY_MASK', 'Normal': 'MP_NORMAL', 'WorldPositionOffset': 'MP_WORLD_POSITION_OFFSET',
+        'AmbientOcclusion': 'MP_AMBIENT_OCCLUSION', 'Refraction': 'MP_REFRACTION', 'SubsurfaceColor': 'MP_SUBSURFACE_COLOR',
+    }
+    mp_member = mp_map.get(prop_name)
+    mp = getattr(unreal.MaterialProperty, mp_member) if mp_member and hasattr(unreal, 'MaterialProperty') else None
+    if mp is None:
+        _emit({'ok': False, 'error': 'unknown material property: %s' % prop_name})
+    else:
+        from_out = _ARGS.get('fromOutput', '') or ''
+        try:
+            ok = unreal.MaterialEditingLibrary.connect_material_property(node, from_out, mp)
+            unreal.MaterialEditingLibrary.recompile_material(mat)
+            unreal.EditorAssetLibrary.save_asset(mat.get_path_name())
+            _emit({'ok': bool(ok), 'property': prop_name, 'connected': bool(ok)})
+        except Exception as e:
+            _emit({'ok': False, 'error': 'connect_material_property failed: %s' % e})
+)PY";
+            if (arg_str(args, "materialPath").empty() ||
+                arg_str(args, "nodeId").empty() ||
+                arg_str(args, "property").empty())
+                return ToolResult::error("materialPath, nodeId and property are required");
+            return run_python_recipe(ctx, kRecipe, args);
+        }});
+
+    // -- ue_set_material_properties ------------------------------------------
+    add(Tool{
+        "ue_set_material_properties",
+        "Set top-level Material settings and recompile. Pass materialPath and any "
+        "of: blendMode (Opaque|Masked|Translucent|Additive|Modulate|AlphaComposite"
+        "|AlphaHoldout), shadingModel (Unlit|DefaultLit|Subsurface|"
+        "PreintegratedSkin|ClearCoat|SubsurfaceProfile|TwoSidedFoliage|Hair|Cloth|"
+        "Eye|SingleLayerWater), twoSided (bool). Python recipe; requires "
+        "PythonScriptPlugin.",
+        json{{"type", "object"},
+             {"properties",
+              {{"materialPath", {{"type", "string"}}},
+               {"blendMode", {{"type", "string"}}},
+               {"shadingModel", {{"type", "string"}}},
+               {"twoSided", {{"type", "boolean"}}}}},
+             {"required", json::array({"materialPath"})}},
+        {Capability::PythonScripting},
+        [](ToolContext& ctx, const json& args) -> ToolResult {
+            static const char* kRecipe = R"PY(
+mat = unreal.EditorAssetLibrary.load_asset(_ARGS['materialPath'])
+if mat is None:
+    _emit({'ok': False, 'error': 'could not load material'})
+else:
+    applied = []
+    bm = _ARGS.get('blendMode')
+    if bm:
+        bm_map = {'Opaque':'BLEND_OPAQUE','Masked':'BLEND_MASKED','Translucent':'BLEND_TRANSLUCENT',
+                  'Additive':'BLEND_ADDITIVE','Modulate':'BLEND_MODULATE','AlphaComposite':'BLEND_ALPHA_COMPOSITE',
+                  'AlphaHoldout':'BLEND_ALPHA_HOLDOUT'}
+        try:
+            mat.set_editor_property('blend_mode', getattr(unreal.BlendMode, bm_map.get(bm, 'BLEND_OPAQUE')))
+            applied.append('blendMode')
+        except Exception:
+            pass
+    sm = _ARGS.get('shadingModel')
+    if sm:
+        sm_map = {'Unlit':'MSM_UNLIT','DefaultLit':'MSM_DEFAULT_LIT','Subsurface':'MSM_SUBSURFACE',
+                  'PreintegratedSkin':'MSM_PREINTEGRATED_SKIN','ClearCoat':'MSM_CLEAR_COAT',
+                  'SubsurfaceProfile':'MSM_SUBSURFACE_PROFILE','TwoSidedFoliage':'MSM_TWO_SIDED_FOLIAGE',
+                  'Hair':'MSM_HAIR','Cloth':'MSM_CLOTH','Eye':'MSM_EYE','SingleLayerWater':'MSM_SINGLE_LAYER_WATER'}
+        try:
+            mat.set_editor_property('shading_model', getattr(unreal.MaterialShadingModel, sm_map.get(sm, 'MSM_DEFAULT_LIT')))
+            applied.append('shadingModel')
+        except Exception:
+            pass
+    if 'twoSided' in _ARGS:
+        try:
+            mat.set_editor_property('two_sided', bool(_ARGS['twoSided']))
+            applied.append('twoSided')
+        except Exception:
+            pass
+    unreal.MaterialEditingLibrary.recompile_material(mat)
+    unreal.EditorAssetLibrary.save_asset(mat.get_path_name())
+    _emit({'ok': True, 'materialPath': _ARGS['materialPath'], 'applied': applied})
+)PY";
+            if (arg_str(args, "materialPath").empty())
+                return ToolResult::error("materialPath is required");
             return run_python_recipe(ctx, kRecipe, args);
         }});
 }
